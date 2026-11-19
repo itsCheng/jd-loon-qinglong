@@ -7,7 +7,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '2.0.1';
+  var VERSION = '2.0.2';
   var ARG = (typeof $argument === 'object' && $argument) ? $argument : {};
   var CFG = {
     base: str(ARG.ql_url).replace(/\/+$/, ''),
@@ -90,14 +90,47 @@
     return '业务code=' + code + (msg ? '，message=' + msg.slice(0, 100) : '') + (keys ? '，响应字段=' + keys : '');
   }
   function parseBody(data) {
-    if (data && typeof data === 'object') return data;
-    try { return JSON.parse(String(data || '')); } catch (e) { return null; }
+    // Loon 不同版本/响应类型下，第三个回调参数可能是文本、对象，
+    // 也可能为空而正文实际挂在 response.body。统一提取真正的 JSON 正文。
+    if (data === null || data === undefined) return null;
+    if (typeof data === 'string') {
+      var raw = data.replace(/^\uFEFF/, '').trim();
+      if (!raw) return null;
+      try { return JSON.parse(raw); } catch (e) { return null; }
+    }
+    if (typeof data === 'object') {
+      if (Array.isArray(data)) return data;
+      if (Object.prototype.hasOwnProperty.call(data, 'code') ||
+          Object.prototype.hasOwnProperty.call(data, 'data') ||
+          Object.prototype.hasOwnProperty.call(data, 'message') ||
+          Object.prototype.hasOwnProperty.call(data, 'msg')) return data;
+      if (typeof data.body === 'string') return parseBody(data.body);
+      if (typeof data.responseText === 'string') return parseBody(data.responseText);
+      if (typeof data.text === 'string') return parseBody(data.text);
+      // 不把 Loon 的空响应包装对象误当成业务 JSON。
+      if (Object.keys(data).length === 0) return null;
+      return data;
+    }
+    return null;
+  }
+  function responseObject(resp, data) {
+    var obj = parseBody(data);
+    if (obj !== null) return obj;
+    if (resp) {
+      obj = parseBody(resp.body);
+      if (obj !== null) return obj;
+      obj = parseBody(resp.data);
+      if (obj !== null) return obj;
+      obj = parseBody(resp.responseText);
+      if (obj !== null) return obj;
+    }
+    return null;
   }
   function apiSuccess(httpStatus, obj) {
     // HTTP 层只判断传输状态及明确的业务失败。青龙 2.19.2 的部分接口
     // 可能返回不带顶层 code 的 JSON；不能因此误判失败，也不能仅凭 200 宣告成功。
     if (httpStatus < 200 || httpStatus >= 300 || !obj || typeof obj !== 'object') return false;
-    if (!Object.prototype.hasOwnProperty.call(obj, 'code')) return true; // 交由各接口做结构校验
+    if (!Object.prototype.hasOwnProperty.call(obj, 'code')) return true; // 仅放行到接口级结构校验；列表/Token/详情均必须有有效数据
     var code = obj.code;
     if (code === 200 || code === 0 || code === '200' || code === '0') return true;
     return false;
@@ -112,7 +145,7 @@
     if (!$httpClient || typeof $httpClient[fn] !== 'function') { cb('Loon HTTP 方法不可用：' + method); return; }
     $httpClient[fn](opt, function (err, resp, data) {
       var status = resp ? Number(resp.status || resp.statusCode || 0) : 0;
-      var obj = parseBody(data);
+      var obj = responseObject(resp, data);
       if (err) { cb('网络请求失败：' + str(err).slice(0, 120), obj, status); return; }
       if (!resp) { cb('没有收到 HTTP 响应', obj, status); return; }
       if (status < 200 || status >= 300) { cb('HTTP ' + status + '；' + safeLogResponse(obj, data), obj, status); return; }
@@ -154,6 +187,9 @@
     if (obj.data && Array.isArray(obj.data.files)) return obj.data.files;
     if (obj.data && Array.isArray(obj.data.envs)) return obj.data.envs;
     if (obj.data && Array.isArray(obj.data.items)) return obj.data.items;
+    if (Array.isArray(obj.files)) return obj.files;
+    if (Array.isArray(obj.list)) return obj.list;
+    if (Array.isArray(obj.items)) return obj.items;
     return [];
   }
   function mask(pin) { return pin.length > 4 ? pin.slice(0, 2) + '***' + pin.slice(-2) : '***'; }
@@ -224,9 +260,9 @@
     ql('GET', '/open/configs/files', null, function (e, obj) {
       if (e) { cb('读取配置文件列表失败：' + e); return; }
       var files = arrayData(obj), file = null;
-      // 无 code 的响应允许进入这里，但必须具有可识别的列表结构，不能把代理页/错误对象当空列表。
-      if (!Array.isArray(files) || (obj.data === undefined && !Array.isArray(obj))) {
-        cb('配置文件列表响应结构异常：未找到 data 数组；响应字段=' + Object.keys(obj || {}).slice(0, 8).join(',')); return;
+      // 不允许把空对象、代理错误页或空响应当成“空文件列表”。
+      if (!Array.isArray(files) || files.length === 0 && !(obj && (Array.isArray(obj.data) || Array.isArray(obj.files) || Array.isArray(obj.list) || Array.isArray(obj.items)))) {
+        cb('配置文件列表未取得有效数组（检查青龙响应正文/反向代理；已兼容 Loon response.body）'); return;
       }
       for (var i = 0; i < files.length; i++) {
         var candidates = [files[i].title, files[i].value, files[i].name, files[i].path];
@@ -238,6 +274,7 @@
       ql('GET', '/open/configs/detail?path=' + encodeURIComponent(path), null, function (de, detail) {
         if (de) { cb('读取 jdUser.ini 详情失败：' + de); return; }
         var content = detail && detail.data;
+        if (typeof content !== 'string' && detail && typeof detail.content === 'string') content = detail.content;
         if (content && typeof content === 'object') content = content.content !== undefined ? content.content : (content.value !== undefined ? content.value : content);
         if (typeof content !== 'string') { cb('jdUser.ini 内容不是字符串，拒绝覆盖以防损坏文件'); return; }
         var changed;
