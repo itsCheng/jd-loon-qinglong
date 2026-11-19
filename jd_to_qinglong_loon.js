@@ -8,7 +8,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '2.0.5';
+  var VERSION = '2.0.6';
   var ARG = (typeof $argument === 'object' && $argument) ? $argument : {};
   var CFG = {
     base: str(ARG.ql_url).replace(/\/+$/, ''),
@@ -301,36 +301,33 @@
     return false;
   }
   function updateIni(pin, value, field, cb) {
-    ql('GET', '/open/configs/files', null, function (e, obj) {
-      if (e) { cb('读取配置文件列表失败：' + e); return; }
-      var files = arrayData(obj), file = null;
-      // 不允许把空对象、代理错误页或空响应当成“空文件列表”。
-      if (!Array.isArray(files) || files.length === 0 && !(obj && (Array.isArray(obj.data) || Array.isArray(obj.files) || Array.isArray(obj.list) || Array.isArray(obj.items)))) {
-        cb('配置文件列表未取得有效数组（检查青龙响应正文/反向代理；已兼容 Loon response.body）'); return;
+    // 不再依赖 /open/configs/files 列表接口。
+    // 青龙 OpenAPI 同时提供 /open/configs/{file} 读取指定配置文件，
+    // 直接读取 jdUser.ini，避免列表响应结构差异导致整个写入流程中断。
+    var path = 'jdUser.ini';
+    var readPath = '/open/configs/' + encodeURIComponent(path);
+    ql('GET', readPath, null, function (e, detail) {
+      if (e) { cb('直接读取 jdUser.ini 失败：' + e); return; }
+      var content = extractConfigText(detail);
+      if (typeof content !== 'string') {
+        cb('青龙未返回 jdUser.ini 字符串正文，已停止写入保护原文件；响应字段=' +
+          (detail && typeof detail === 'object' ? Object.keys(detail).join(',') : typeof detail));
+        return;
       }
-      for (var i = 0; i < files.length; i++) {
-        var candidates = [files[i].title, files[i].value, files[i].name, files[i].path];
-        for (var j = 0; j < candidates.length; j++) if (str(candidates[j]).split('/').pop() === 'jdUser.ini') { file = files[i]; break; }
-        if (file) break;
-      }
-      if (!file) { cb('配置文件列表没有 jdUser.ini（检查文件名及 configs 权限）'); return; }
-      var path = str(file.value || file.path || file.title || file.name);
-      ql('GET', '/open/configs/detail?path=' + encodeURIComponent(path), null, function (de, detail) {
-        if (de) { cb('读取 jdUser.ini 详情失败：' + de); return; }
-        var content = extractConfigText(detail);
-        if (typeof content !== 'string') { cb('jdUser.ini 正文结构无法识别，拒绝覆盖以防损坏文件'); return; }
-        var changed;
-        try { changed = patchIni(content, pin, field, value); } catch (ex) { cb('解析 jdUser.ini 失败：' + String(ex)); return; }
-        if (changed === content) { cb(null, '已存在相同内容'); return; }
-        ql('POST', '/open/configs/save', { name: path, content: changed }, function (se) {
-          if (se) { cb('保存 jdUser.ini 失败：' + se); return; }
-          // 保存后重新读取并校验，避免把接口接受请求误报成写入成功。
-          ql('GET', '/open/configs/detail?path=' + encodeURIComponent(path), null, function (ve, verify) {
-            if (ve) { cb('保存请求成功，但回读校验失败：' + ve); return; }
-            var saved = extractConfigText(verify);
-            if (typeof saved !== 'string' || !iniHasValue(saved, pin, field, value)) { cb('保存请求已返回成功，但回读未找到目标 PIN 的目标字段，不能确认写入'); return; }
-            cb(null, '写入并回读校验成功');
-          });
+      var changed;
+      try { changed = patchIni(content, pin, field, value); }
+      catch (ex) { cb('解析 jdUser.ini 失败：' + String(ex)); return; }
+      if (changed === content) { cb(null, '已存在相同内容'); return; }
+      ql('POST', '/open/configs/save', { name: path, content: changed }, function (se) {
+        if (se) { cb('保存 jdUser.ini 失败：' + se); return; }
+        // 保存后仍通过指定文件接口回读；未验证目标 PIN/字段前绝不报告成功。
+        ql('GET', readPath, null, function (ve, verify) {
+          if (ve) { cb('保存请求成功，但回读校验失败：' + ve); return; }
+          var saved = extractConfigText(verify);
+          if (typeof saved !== 'string' || !iniHasValue(saved, pin, field, value)) {
+            cb('保存请求已返回成功，但回读未找到目标 PIN 的目标字段，不能确认写入'); return;
+          }
+          cb(null, '写入并回读校验成功');
         });
       });
     });
@@ -401,10 +398,10 @@
     if (!CFG.base || !CFG.clientId || !CFG.clientSecret) { log('请填写青龙连接参数'); finish(); return; }
     ql('GET', '/open/envs?searchValue=JD_COOKIE', null, function (e) {
       if (e) { log('青龙环境变量接口测试失败：' + e); finish(); return; }
-      ql('GET', '/open/configs/files', null, function (ce, obj) {
-        if (ce) { log('环境变量权限正常；配置文件接口失败：' + ce); finish(); return; }
-        var names = arrayData(obj).map(function (x) { return str(x.title || x.value || x.name || x.path); });
-        log('连接测试通过：Token、envs、configs 均可用；jdUser.ini=' + (names.some(function (n) { return n.split('/').pop() === 'jdUser.ini'; }) ? '已找到' : '未找到'));
+      ql('GET', '/open/configs/' + encodeURIComponent('jdUser.ini'), null, function (ce, obj) {
+        if (ce) { log('环境变量权限正常；直接读取 jdUser.ini 失败：' + ce); finish(); return; }
+        var content = extractConfigText(obj);
+        log(typeof content === 'string' ? '连接测试通过：Token、envs、jdUser.ini 读取均正常' : 'Token、envs 正常，但 jdUser.ini 响应没有字符串正文；响应字段=' + (obj && typeof obj === 'object' ? Object.keys(obj).join(',') : typeof obj));
         finish();
       });
     });
