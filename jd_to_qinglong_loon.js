@@ -1,13 +1,14 @@
 /*
- * 京东 CK 自动同步到青龙 - Loon 独立重构版（青龙 2.19.2 响应兼容修正版）
+ * 京东 CK 自动同步到青龙 - Loon 独立重构版（同 PIN 新增/覆盖逻辑修正版）
  * 主 App: pt_key/pt_pin -> JD_COOKIE；wskey -> JD_WSCK（可独立关闭）及 jdUser.ini[wskey]
  * 特价版: pt_key/pt_pin -> JD_COOKIE（可独立关闭）；wskey -> jdUser.ini[jskey]（可独立关闭）
+ * JD_COOKIE 按 pt_pin 匹配；JD_WSCK 按 pin 匹配；jdUser.ini 按 [PIN] 区段新增/覆盖目标字段。
  * 所有青龙请求只访问用户配置的 QL_URL，并固定 DIRECT；不含 PHP 中转、遥测或第三方上传。
  */
 (function () {
   'use strict';
 
-  var VERSION = '2.0.2';
+  var VERSION = '2.0.5';
   var ARG = (typeof $argument === 'object' && $argument) ? $argument : {};
   var CFG = {
     base: str(ARG.ql_url).replace(/\/+$/, ''),
@@ -193,26 +194,37 @@
     return [];
   }
   function mask(pin) { return pin.length > 4 ? pin.slice(0, 2) + '***' + pin.slice(-2) : '***'; }
-  function envHasPin(value, pin) {
-    var m = String(value || '').match(/(?:^|;)\s*pt_pin\s*=\s*([^;]+)/);
-    return !!m && decode(m[1].trim()) === pin;
+  function envHasPin(name, value, pin) {
+    // JD_COOKIE 使用 pt_pin；JD_WSCK 使用 pin。两者格式不同，必须分别匹配。
+    var key = name === 'JD_WSCK' ? 'pin' : 'pt_pin';
+    var re = new RegExp('(?:^|;)\\s*' + key + '\\s*=\\s*([^;]+)', 'i');
+    var m = String(value || '').match(re);
+    return !!m && decode(m[1].trim()).replace(/^['"]|['"]$/g, '') === pin;
   }
   function upsertEnv(name, value, pin, cb) {
     ql('GET', '/open/envs?searchValue=' + encodeURIComponent(name), null, function (err, obj) {
       if (err) { cb('查询环境变量 ' + name + ' 失败：' + err); return; }
-      var list = arrayData(obj), found = null;
-      for (var i = 0; i < list.length; i++) if (list[i].name === name && envHasPin(list[i].value, pin)) { found = list[i]; break; }
-      if (found) {
-        var payload = { id: found.id, name: name, value: value };
-        if (found.remarks !== undefined) payload.remarks = found.remarks;
-        ql('PUT', '/open/envs', payload, function (e) {
-          if (e) { cb('更新环境变量 ' + name + ' 失败：' + e); return; }
-          var id = found.id;
-          ql('PUT', '/open/envs/enable', [id], function (ee) {
-            if (ee) { cb('变量已更新，但启用失败：' + ee); return; }
-            cb(null, '更新');
+      var list = arrayData(obj), found = [];
+      for (var i = 0; i < list.length; i++) {
+        if (list[i] && list[i].name === name && envHasPin(name, list[i].value, pin) && list[i].id !== undefined) found.push(list[i]);
+      }
+      if (found.length) {
+        // 历史上若已有重复的同名同 PIN 项，全部更新，避免保留旧凭据。
+        var index = 0, failed = false;
+        function updateNext() {
+          if (index >= found.length) { cb(failed ? '部分同 PIN 环境变量更新/启用失败' : null, '更新'); return; }
+          var item = found[index++];
+          var payload = { id: item.id, name: name, value: value };
+          if (item.remarks !== undefined) payload.remarks = item.remarks;
+          ql('PUT', '/open/envs', payload, function (e) {
+            if (e) { failed = true; log('更新同 PIN 变量 id=' + item.id + ' 失败：' + e); updateNext(); return; }
+            ql('PUT', '/open/envs/enable', [item.id], function (ee) {
+              if (ee) { failed = true; log('启用变量 id=' + item.id + ' 失败：' + ee); }
+              updateNext();
+            });
           });
-        });
+        }
+        updateNext();
       } else {
         ql('POST', '/open/envs', [{ name: name, value: value, remarks: pin }], function (e) {
           if (e) { cb('新增环境变量 ' + name + ' 失败：' + e); return; }
@@ -221,30 +233,30 @@
       }
     });
   }
-  function quoteIni(v) {
-    v = String(v);
-    if (/[\s=;#"'\\]/.test(v)) return '"' + v.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
-    return v;
-  }
   function patchIni(text, pin, key, value) {
-    var newline = String(text).indexOf('\r\n') >= 0 ? '\r\n' : '\n';
-    var lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
-    var begin = -1, end = lines.length, i, match;
+    // 只改目标 PIN 区段中的目标字段；没有 PIN 则追加新区段；没有字段则在该区段补入。字段写为 key=value，不改写 wskey/jskey 原值。
+    // 其余账号、注释、空行及字段内容保留。使用文件原有主要换行符。
+    text = String(text);
+    var newline = text.indexOf('\r\n') >= 0 ? '\r\n' : (text.indexOf('\r') >= 0 && text.indexOf('\n') < 0 ? '\r' : '\n');
+    var lines = text.split(/\r\n|\n|\r/);
+    var begins = [], i, m;
     for (i = 0; i < lines.length; i++) {
-      match = lines[i].match(/^\s*\[([^\]]+)\]\s*(?:[;#].*)?$/);
-      if (match) {
-        if (begin >= 0) { end = i; break; }
-        if (match[1].trim() === pin) begin = i;
-      }
+      m = lines[i].match(/^\s*\[([^\]]+)\]\s*(?:[;#].*)?$/);
+      if (m && m[1].trim() === pin) begins.push(i);
     }
-    var line = key + ' = ' + quoteIni(value);
-    if (begin >= 0) {
-      var replaced = false;
-      for (i = begin + 1; i < end; i++) {
-        match = lines[i].match(/^\s*(wskey|jskey)\s*=/i);
-        if (match && match[1].toLowerCase() === key.toLowerCase()) { lines[i] = line; replaced = true; break; }
+    if (begins.length > 1) throw new Error('jdUser.ini 存在重复 PIN 区段 [' + pin + ']，为避免改错账号已停止');
+    var line = key + '=' + String(value);
+    if (begins.length === 1) {
+      var begin = begins[0], end = lines.length;
+      for (i = begin + 1; i < lines.length; i++) {
+        if (/^\s*\[[^\]]+\]\s*(?:[;#].*)?$/.test(lines[i])) { end = i; break; }
       }
-      if (!replaced) {
+      var matches = [], keyRe = new RegExp('^\\s*' + key + '\\s*=', 'i');
+      for (i = begin + 1; i < end; i++) if (keyRe.test(lines[i])) matches.push(i);
+      if (matches.length) {
+        lines[matches[0]] = line;
+        for (i = matches.length - 1; i >= 1; i--) lines.splice(matches[i], 1);
+      } else {
         var at = end;
         while (at > begin + 1 && lines[at - 1] === '') at--;
         lines.splice(at, 0, line);
@@ -252,9 +264,41 @@
     } else {
       while (lines.length && lines[lines.length - 1] === '') lines.pop();
       if (lines.length) lines.push('');
-      lines.push('[' + pin + ']', 'pin = ' + quoteIni(pin), line);
+      lines.push('[' + pin + ']', 'pin=' + pin, line);
     }
-    return lines.join(newline).replace(/[\r\n]*$/, '') + newline;
+    return lines.join(newline);
+  }
+  function extractConfigText(obj, depth) {
+    depth = depth || 0;
+    if (typeof obj === 'string') {
+      var t = obj.replace(/^\uFEFF/, '');
+      try { var parsed = JSON.parse(t); if (typeof parsed === 'string') return parsed; } catch (e) {}
+      return t;
+    }
+    if (!obj || typeof obj !== 'object' || depth > 5) return null;
+    var keys = ['content', 'value', 'data', 'body', 'text'];
+    for (var i = 0; i < keys.length; i++) if (Object.prototype.hasOwnProperty.call(obj, keys[i])) {
+      var found = extractConfigText(obj[keys[i]], depth + 1);
+      if (typeof found === 'string') return found;
+    }
+    return null;
+  }
+  function iniHasValue(text, pin, field, value) {
+    var lines = String(text).split(/\r\n|\n|\r/), section = -1, end = lines.length, i, m;
+    for (i = 0; i < lines.length; i++) {
+      m = lines[i].match(/^\s*\[([^\]]+)\]\s*(?:[;#].*)?$/);
+      if (m && m[1].trim() === pin) { section = i; break; }
+    }
+    if (section < 0) return false;
+    for (i = section + 1; i < lines.length; i++) if (/^\s*\[[^\]]+\]\s*(?:[;#].*)?$/.test(lines[i])) { end = i; break; }
+    for (i = section + 1; i < end; i++) {
+      m = lines[i].match(new RegExp('^\\s*' + field + '\\s*=\\s*(.*?)\\s*$', 'i'));
+      if (m) {
+        var actual = m[1].trim().replace(/^"(.*)"$/, '$1').replace(/\\(["\\])/g, '$1');
+        if (actual === String(value)) return true;
+      }
+    }
+    return false;
   }
   function updateIni(pin, value, field, cb) {
     ql('GET', '/open/configs/files', null, function (e, obj) {
@@ -273,10 +317,8 @@
       var path = str(file.value || file.path || file.title || file.name);
       ql('GET', '/open/configs/detail?path=' + encodeURIComponent(path), null, function (de, detail) {
         if (de) { cb('读取 jdUser.ini 详情失败：' + de); return; }
-        var content = detail && detail.data;
-        if (typeof content !== 'string' && detail && typeof detail.content === 'string') content = detail.content;
-        if (content && typeof content === 'object') content = content.content !== undefined ? content.content : (content.value !== undefined ? content.value : content);
-        if (typeof content !== 'string') { cb('jdUser.ini 内容不是字符串，拒绝覆盖以防损坏文件'); return; }
+        var content = extractConfigText(detail);
+        if (typeof content !== 'string') { cb('jdUser.ini 正文结构无法识别，拒绝覆盖以防损坏文件'); return; }
         var changed;
         try { changed = patchIni(content, pin, field, value); } catch (ex) { cb('解析 jdUser.ini 失败：' + String(ex)); return; }
         if (changed === content) { cb(null, '已存在相同内容'); return; }
@@ -285,16 +327,14 @@
           // 保存后重新读取并校验，避免把接口接受请求误报成写入成功。
           ql('GET', '/open/configs/detail?path=' + encodeURIComponent(path), null, function (ve, verify) {
             if (ve) { cb('保存请求成功，但回读校验失败：' + ve); return; }
-            var saved = verify && verify.data;
-            if (saved && typeof saved === 'object') saved = saved.content !== undefined ? saved.content : saved.value;
-            if (typeof saved !== 'string' || saved.indexOf(keyLine(field, value)) < 0) { cb('保存请求已返回成功，但回读未找到目标字段，不能确认写入'); return; }
+            var saved = extractConfigText(verify);
+            if (typeof saved !== 'string' || !iniHasValue(saved, pin, field, value)) { cb('保存请求已返回成功，但回读未找到目标 PIN 的目标字段，不能确认写入'); return; }
             cb(null, '写入并回读校验成功');
           });
         });
       });
     });
   }
-  function keyLine(k, v) { return k + ' = ' + quoteIni(v); }
   function process(app, creds, cb) {
     var pin = validPin(creds.pt_pin), ptKey = str(creds.pt_key), wskey = str(creds.wskey);
     var st = readState(), now = Math.floor(Date.now() / 1000);
