@@ -41,7 +41,7 @@ var STORE = {
   FAIL_PREFIX: 'jdql_direct_fail_v1_'
 };
 
-var APP_NAMES = { jd: '京东主App', lite: '京东特价版' };
+var APP_NAMES = { jd: '京东主App', lite: '京东特价版', unknown: '未识别App' };
 var finished = false;
 
 // Loon plugin passes these values through $argument; credentials are not stored in this public JS file.
@@ -130,13 +130,37 @@ function cookieValue(cookie, name) {
 function detectApp(headers) {
   var ua = headerValue(headers, 'User-Agent');
   var pkg = headerValue(headers, 'X-Referer-Package');
-  var jec = headerValue(headers, 'J-E-C') + ' ' + headerValue(headers, 'J-E-H');
+  var jec = headerValue(headers, 'J-E-C');
+  var jeh = headerValue(headers, 'J-E-H');
+  var meta = ua + ' ' + pkg + ' ' + jec + ' ' + jeh;
   if (/JDMobileLite/i.test(ua)) return 'lite';
+  // Lite 的包名优先级高于通用 JD4iPhone UA，避免被主App规则抢先匹配。
+  if (/com\.jd\.jdmobilelite/i.test(meta)) return 'lite';
   if (/JD4iPhone/i.test(ua)) return 'jd';
-  if (/com\.jd\.jdmobilelite/i.test(pkg) || /com\.jd\.jdmobilelite/i.test(jec)) return 'lite';
-  if (/com\.360buy\.jdmobile/i.test(pkg)) return 'jd';
+  if (/com\.360buy\.jdmobile/i.test(meta)) return 'jd';
   if (/lite/i.test(ua) || /lite/i.test(pkg)) return 'lite';
-  return 'jd';
+  // 不再把无法识别的请求默认归入主App，避免特价版凭证被错误分流。
+  return 'unknown';
+}
+function diagnosticText(value) {
+  return String(value || '').replace(/[\r\n\t]/g, ' ').replace(/\s{2,}/g, ' ').slice(0, 180);
+}
+function logCaptureDiagnostic(headers, url, app, hasPtKey, hasPin, hasWskey) {
+  var ua = headerValue(headers, 'User-Agent');
+  var pkg = headerValue(headers, 'X-Referer-Package');
+  var jec = headerValue(headers, 'J-E-C');
+  var jeh = headerValue(headers, 'J-E-H');
+  var fingerprint = hash8([ua, pkg, jec, jeh, app].join('|'));
+  var key = 'jdql_diag_' + fingerprint;
+  var now = Math.floor(Date.now() / 1000);
+  var last = Number(readStore(key, '0')) || 0;
+  if (now - last < 60) return;
+  writeStore(key, String(now));
+  var hostPath = String(url || '').replace(/^https?:\/\//i, '').split('?')[0].slice(0, 180);
+  log('捕获诊断：识别=' + app + '；请求=' + hostPath +
+    '；pt_key=' + (hasPtKey ? '有' : '无') + '；pt_pin=' + (hasPin ? '有' : '无') + '；wskey=' + (hasWskey ? '有' : '无') +
+    '；UA=' + diagnosticText(ua) + '；X-Referer-Package=' + diagnosticText(pkg) +
+    '；J-E-C=' + diagnosticText(jec) + '；J-E-H=' + diagnosticText(jeh));
 }
 function appKey(app) { return app + '_' + CONFIG.DEVICE_TAG; }
 function qlBase() { return CONFIG.QL_URL.replace(/\/+$/, ''); }
@@ -482,7 +506,15 @@ function main() {
   if (!ptKey && !ptPin && !wskey) { done(); return; }
   if (!ptPin) ptKey = '';
   var app = detectApp(headers);
+  logCaptureDiagnostic(headers, url, app, !!ptKey, !!ptPin, !!wskey);
+  if (app === 'unknown') {
+    log('请求头未能识别为京东主App或特价版，本次安全跳过；请把上方“捕获诊断”日志发来排查。未记录任何 Cookie 或凭证值。');
+    done(); return;
+  }
   if ((app === 'jd' && !CONFIG.CAPTURE_JD) || (app === 'lite' && !CONFIG.CAPTURE_LITE)) { done(); return; }
+  log('捕获开关检查：' + APP_NAMES[app] + '；捕获=' + ((app === 'jd' ? CONFIG.CAPTURE_JD : CONFIG.CAPTURE_LITE) ? '开' : '关') +
+    '；JD_COOKIE=' + ((app === 'jd' ? CONFIG.UPLOAD_JD_COOKIE : CONFIG.UPLOAD_LITE_COOKIE) ? '开' : '关') +
+    '；wskey目标=' + (wskeyUploadEnabled(app) ? '开' : '关'));
   var now = Math.floor(Date.now() / 1000);
   var state = localState(app), targetPin = '';
 
