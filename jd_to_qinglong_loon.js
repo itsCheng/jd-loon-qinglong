@@ -1,5 +1,5 @@
 /*
- * 京东 CK 自动同步到青龙 - Loon
+ * 京东 CK 自动同步到青龙 - Loon 独立重构版（青龙 2.19.2 响应兼容修正版）
  * 主 App: pt_key/pt_pin -> JD_COOKIE；wskey -> JD_WSCK（可独立关闭）及 jdUser.ini[wskey]
  * 特价版: pt_key/pt_pin -> JD_COOKIE（可独立关闭）；wskey -> jdUser.ini[jskey]（可独立关闭）
  * 所有青龙请求只访问用户配置的 QL_URL，并固定 DIRECT；不含 PHP 中转、遥测或第三方上传。
@@ -7,7 +7,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '2.0.0';
+  var VERSION = '2.0.1';
   var ARG = (typeof $argument === 'object' && $argument) ? $argument : {};
   var CFG = {
     base: str(ARG.ql_url).replace(/\/+$/, ''),
@@ -84,18 +84,22 @@
     return ('00000000' + h.toString(16)).slice(-8);
   }
   function safeLogResponse(obj, raw) {
-    var code = obj && obj.code !== undefined ? String(obj.code) : '无';
-    var msg = obj ? str(obj.message || obj.msg) : '';
-    return '业务code=' + code + (msg ? '，message=' + msg.slice(0, 100) : '');
+    var code = obj && obj.code !== undefined ? String(obj.code) : '未提供';
+    var msg = obj ? str(obj.message || obj.msg || obj.error) : '';
+    var keys = obj && typeof obj === 'object' ? Object.keys(obj).slice(0, 8).join(',') : '';
+    return '业务code=' + code + (msg ? '，message=' + msg.slice(0, 100) : '') + (keys ? '，响应字段=' + keys : '');
   }
   function parseBody(data) {
     if (data && typeof data === 'object') return data;
     try { return JSON.parse(String(data || '')); } catch (e) { return null; }
   }
   function apiSuccess(httpStatus, obj) {
+    // HTTP 层只判断传输状态及明确的业务失败。青龙 2.19.2 的部分接口
+    // 可能返回不带顶层 code 的 JSON；不能因此误判失败，也不能仅凭 200 宣告成功。
     if (httpStatus < 200 || httpStatus >= 300 || !obj || typeof obj !== 'object') return false;
-    // 青龙不同版本/文档存在 code=200 与 code=0 两种成功约定；不把任意 HTTP 200 当成功。
-    if (obj.code === 200 || obj.code === 0 || obj.code === '200' || obj.code === '0') return true;
+    if (!Object.prototype.hasOwnProperty.call(obj, 'code')) return true; // 交由各接口做结构校验
+    var code = obj.code;
+    if (code === 200 || code === 0 || code === '200' || code === '0') return true;
     return false;
   }
   function http(method, path, body, token, cb) {
@@ -142,6 +146,7 @@
     });
   }
   function arrayData(obj) {
+    if (Array.isArray(obj)) return obj;
     if (!obj || obj.data === undefined || obj.data === null) return [];
     if (Array.isArray(obj.data)) return obj.data;
     if (obj.data && Array.isArray(obj.data.data)) return obj.data.data;
@@ -219,6 +224,10 @@
     ql('GET', '/open/configs/files', null, function (e, obj) {
       if (e) { cb('读取配置文件列表失败：' + e); return; }
       var files = arrayData(obj), file = null;
+      // 无 code 的响应允许进入这里，但必须具有可识别的列表结构，不能把代理页/错误对象当空列表。
+      if (!Array.isArray(files) || (obj.data === undefined && !Array.isArray(obj))) {
+        cb('配置文件列表响应结构异常：未找到 data 数组；响应字段=' + Object.keys(obj || {}).slice(0, 8).join(',')); return;
+      }
       for (var i = 0; i < files.length; i++) {
         var candidates = [files[i].title, files[i].value, files[i].name, files[i].path];
         for (var j = 0; j < candidates.length; j++) if (str(candidates[j]).split('/').pop() === 'jdUser.ini') { file = files[i]; break; }
