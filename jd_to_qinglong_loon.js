@@ -1,428 +1,544 @@
 /*
- * 京东 CK 自动同步到青龙 - Loon 独立重构版（同 PIN 新增/覆盖逻辑修正版）
- * 主 App: pt_key/pt_pin -> JD_COOKIE；wskey -> JD_WSCK（可独立关闭）及 jdUser.ini[wskey]
- * 特价版: pt_key/pt_pin -> JD_COOKIE（可独立关闭）；wskey -> jdUser.ini[jskey]（可独立关闭）
- * JD_COOKIE 按 pt_pin 匹配；JD_WSCK 按 pin 匹配；jdUser.ini 按 [PIN] 区段新增/覆盖目标字段。
- * 所有青龙请求只访问用户配置的 QL_URL，并固定 DIRECT；不含 PHP 中转、遥测或第三方上传。
+ * 京东 CK / wskey -> 青龙 OpenAPI 直连版（Loon）
+ * Based on the uploaded project's business rules:
+ *   Main JD app: pt_key -> JD_COOKIE; wskey -> JD_WSCK + jdUser.ini[wskey]
+ *   JD Lite app: pt_key -> JD_COOKIE; wskey -> jdUser.ini[jskey] only
+ * No PHP relay, no external telemetry, no third-party upload endpoint.
+ *
+ * Credentials are injected from the Loon plugin [Argument] section.
  */
-(function () {
-  'use strict';
 
-  var VERSION = '2.0.6';
-  var ARG = (typeof $argument === 'object' && $argument) ? $argument : {};
-  var CFG = {
-    base: str(ARG.ql_url).replace(/\/+$/, ''),
-    clientId: str(ARG.client_id),
-    clientSecret: str(ARG.client_secret),
-    device: str(ARG.device_tag) || 'iphone-main',
-    captureJD: boolArg('capture_jd', true),
-    captureLite: boolArg('capture_lite', true),
-    jdCookie: boolArg('upload_jd_cookie', true),
-    jdWsck: boolArg('upload_jd_wsck', true),
-    jdIni: boolArg('upload_jd_ini_wskey', true),
-    liteCookie: boolArg('upload_lite_cookie', true),
-    liteIni: boolArg('upload_lite_ini_jskey', true),
-    timeout: 18000,
-    pendingSec: 300,
-    pinRecentSec: 300,
-    dedupeSec: 45
+var CONFIG = {
+  QL_URL: '', // supplied by Loon plugin [Argument]
+  // Public-domain mode: force Qinglong API requests to DIRECT (no proxy node).
+  CLIENT_ID: '',
+  CLIENT_SECRET: '',
+  DEVICE_TAG: 'iphone-main',
+  CAPTURE_JD: true,
+  CAPTURE_LITE: true,
+  UPLOAD_JD_COOKIE: true,
+  UPLOAD_JD_WSCK: true,
+  UPLOAD_JD_INI_WSKEY: true,
+  UPLOAD_LITE_COOKIE: true,
+  UPLOAD_LITE_INI_JSKEY: true,
+  TIMEOUT_MS: 15000,
+  DEDUPE_SECONDS: 30,
+  COOLDOWN_SECONDS: 60,
+  PIN_LOOKBACK_SECONDS: 30,
+  PENDING_WSKEY_SECONDS: 300,
+  PAIR_WINDOW_SECONDS: 300,
+  NOTIFY_REPEAT_SECONDS: 600,
+  NOTIFY_FAILURE_SECONDS: 60,
+  LOG_VERBOSE: false
+};
+
+var STORE = {
+  TOKEN: 'jdql_direct_token_v1',
+  STATE_PREFIX: 'jdql_direct_state_v1_',
+  DEDUPE_PREFIX: 'jdql_direct_dedupe_v1_',
+  LAST_PREFIX: 'jdql_direct_last_v1_',
+  PAIR_PREFIX: 'jdql_direct_pair_v1_',
+  FAIL_PREFIX: 'jdql_direct_fail_v1_'
+};
+
+var APP_NAMES = { jd: '京东主App', lite: '京东特价版' };
+var finished = false;
+
+// Loon plugin passes these values through $argument; credentials are not stored in this public JS file.
+(function applyPluginArguments() {
+  var a = (typeof $argument === 'object' && $argument) ? $argument : {};
+  if (a.ql_url !== undefined && a.ql_url !== null) CONFIG.QL_URL = String(a.ql_url).trim();
+  if (a.client_id !== undefined && a.client_id !== null) CONFIG.CLIENT_ID = String(a.client_id).trim();
+  if (a.client_secret !== undefined && a.client_secret !== null) CONFIG.CLIENT_SECRET = String(a.client_secret).trim();
+  if (a.device_tag !== undefined && a.device_tag !== null && String(a.device_tag).trim()) CONFIG.DEVICE_TAG = String(a.device_tag).trim();
+  if (a.capture_jd !== undefined) CONFIG.CAPTURE_JD = a.capture_jd === true;
+  if (a.capture_lite !== undefined) CONFIG.CAPTURE_LITE = a.capture_lite === true;
+  if (a.upload_jd_cookie !== undefined) CONFIG.UPLOAD_JD_COOKIE = a.upload_jd_cookie === true;
+  if (a.upload_jd_wsck !== undefined) CONFIG.UPLOAD_JD_WSCK = a.upload_jd_wsck === true;
+  if (a.upload_jd_ini_wskey !== undefined) CONFIG.UPLOAD_JD_INI_WSKEY = a.upload_jd_ini_wskey === true;
+  if (a.upload_lite_cookie !== undefined) CONFIG.UPLOAD_LITE_COOKIE = a.upload_lite_cookie === true;
+  if (a.upload_lite_ini_jskey !== undefined) CONFIG.UPLOAD_LITE_INI_JSKEY = a.upload_lite_ini_jskey === true;
+})();
+
+function log(message) {
+  console.log('[JD→青龙] ' + message);
+}
+function notify(title, subtitle, message) {
+  try { $notification.post(title, subtitle || '', message || ''); }
+  catch (e) { log('通知调用失败：' + String(e)); }
+}
+function done() {
+  if (finished) return;
+  finished = true;
+  $done({});
+}
+function readStore(key, fallback) {
+  try {
+    var raw = $persistentStore.read(key);
+    if (raw === null || raw === undefined || raw === '') return fallback;
+    return raw;
+  } catch (e) { return fallback; }
+}
+function writeStore(key, value) {
+  try { return $persistentStore.write(String(value), key); }
+  catch (e) { return false; }
+}
+function removeStore(key) {
+  try { $persistentStore.write(undefined, key); } catch (e) {}
+}
+function readJSON(key, fallback) {
+  try { var v = readStore(key, ''); return v ? JSON.parse(v) : fallback; }
+  catch (e) { return fallback; }
+}
+function writeJSON(key, value) { return writeStore(key, JSON.stringify(value)); }
+function enc(v) { return encodeURIComponent(String(v)); }
+function safeDecode(v) {
+  try { return decodeURIComponent(String(v).replace(/\+/g, '%20')); }
+  catch (e) { return String(v); }
+}
+function hash8(s) {
+  // Non-cryptographic fingerprint used only for local dedup/notification state.
+  var h = 5381, str = String(s || ''), i;
+  for (i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) >>> 0;
+  return ('00000000' + h.toString(16)).slice(-8);
+}
+function validPin(value) {
+  if (value === null || value === undefined) return '';
+  var p = safeDecode(String(value)).trim();
+  if (!p || /^(none|null)$/i.test(p) || /^[*%]+$/.test(p) || p.length > 128) return '';
+  if (/[\r\n\[\]]/.test(p)) return '';
+  return p;
+}
+function headerValue(headers, name) {
+  if (!headers) return '';
+  var keys = Object.keys(headers), i;
+  for (i = 0; i < keys.length; i++) {
+    if (keys[i].toLowerCase() === name.toLowerCase()) return String(headers[keys[i]] || '');
+  }
+  return '';
+}
+function cookieValue(cookie, name) {
+  var parts = String(cookie || '').split(';'), i, pos, key;
+  for (i = 0; i < parts.length; i++) {
+    pos = parts[i].indexOf('=');
+    if (pos < 0) continue;
+    key = parts[i].slice(0, pos).trim();
+    if (key === name) return safeDecode(parts[i].slice(pos + 1).trim());
+  }
+  return '';
+}
+function detectApp(headers) {
+  var ua = headerValue(headers, 'User-Agent');
+  var pkg = headerValue(headers, 'X-Referer-Package');
+  var jec = headerValue(headers, 'J-E-C') + ' ' + headerValue(headers, 'J-E-H');
+  if (/JDMobileLite/i.test(ua)) return 'lite';
+  if (/JD4iPhone/i.test(ua)) return 'jd';
+  if (/com\.jd\.jdmobilelite/i.test(pkg) || /com\.jd\.jdmobilelite/i.test(jec)) return 'lite';
+  if (/com\.360buy\.jdmobile/i.test(pkg)) return 'jd';
+  if (/lite/i.test(ua) || /lite/i.test(pkg)) return 'lite';
+  return 'jd';
+}
+function appKey(app) { return app + '_' + CONFIG.DEVICE_TAG; }
+function qlBase() { return CONFIG.QL_URL.replace(/\/+$/, ''); }
+function parseResponse(data) {
+  if (data && typeof data === 'object') return data;
+  try { return JSON.parse(String(data || '')); } catch (e) { return null; }
+}
+function isApiOK(err, response, body) {
+  if (err || !response) return false;
+  var status = Number(response.status || response.statusCode || 0);
+  if (status < 200 || status >= 300) return false;
+  var obj = parseResponse(body);
+  return !!obj && Number(obj.code) === 200;
+}
+function http(method, url, body, headers, callback) {
+  var opts = {
+    url: url,
+    timeout: CONFIG.TIMEOUT_MS,
+    headers: headers || { 'Accept': 'application/json' },
+    'auto-redirect': false,
+    'auto-cookie': false,
+    node: 'DIRECT'
   };
-  var STORE = 'jdql_rebuild_v2';
-  var ended = false;
-
-  function str(v) { return v === null || v === undefined ? '' : String(v).trim(); }
-  function boolArg(k, d) {
-    if (!Object.prototype.hasOwnProperty.call(ARG, k)) return d;
-    return ARG[k] === true || ARG[k] === 1 || String(ARG[k]).toLowerCase() === 'true';
+  if (body !== null && body !== undefined) {
+    opts.body = JSON.stringify(body);
+    opts.headers['Content-Type'] = 'application/json';
   }
-  function log(s) { console.log('[JDQL v' + VERSION + '] ' + s); }
-  function finish() { if (!ended) { ended = true; $done({}); } }
-  function notify(t, s, m) { try { $notification.post(t, s || '', m || ''); } catch (e) { log('通知失败'); } }
-  function readState() {
-    try { var x = $persistentStore.read(STORE); return x ? JSON.parse(x) : {}; }
-    catch (e) { return {}; }
+  var fn = String(method).toLowerCase();
+  if (!$httpClient[fn]) { callback('Loon HTTP 方法不存在：' + method, null, null); return; }
+  $httpClient[fn](opts, callback);
+}
+function clearToken() { removeStore(STORE.TOKEN); }
+function getToken(callback) {
+  var cached = readJSON(STORE.TOKEN, null), now = Math.floor(Date.now() / 1000);
+  if (cached && cached.token && Number(cached.expiration || 0) > now + 180) {
+    callback(null, cached.token); return;
   }
-  function saveState(x) {
-    try { return $persistentStore.write(JSON.stringify(x), STORE); }
-    catch (e) { return false; }
+  if (!CONFIG.CLIENT_ID || /替换/.test(CONFIG.CLIENT_ID) || !CONFIG.CLIENT_SECRET || /替换/.test(CONFIG.CLIENT_SECRET)) {
+    callback('请先填写青龙 Client ID / Client Secret', null); return;
   }
-  function header(headers, name) {
-    if (!headers) return '';
-    var keys = Object.keys(headers), i;
-    for (i = 0; i < keys.length; i++) if (keys[i].toLowerCase() === name.toLowerCase()) return str(headers[keys[i]]);
-    return '';
-  }
-  function cookieMap(headers) {
-    var raw = '';
-    if (headers) Object.keys(headers).forEach(function (k) { if (k.toLowerCase() === 'cookie' || k.toLowerCase() === 'cookie2') raw += (raw ? '; ' : '') + str(headers[k]); });
-    var out = {}, parts = raw.split(';'), i, p, n;
-    for (i = 0; i < parts.length; i++) {
-      p = parts[i].indexOf('=');
-      if (p < 1) continue;
-      n = parts[i].slice(0, p).trim();
-      if (!Object.prototype.hasOwnProperty.call(out, n)) out[n] = decode(parts[i].slice(p + 1).trim());
+  var url = qlBase() + '/open/auth/token?client_id=' + enc(CONFIG.CLIENT_ID) + '&client_secret=' + enc(CONFIG.CLIENT_SECRET);
+  http('GET', url, null, { 'Accept': 'application/json' }, function (err, response, data) {
+    var obj = parseResponse(data);
+    if (!isApiOK(err, response, data) || !obj.data || !obj.data.token) {
+      callback('青龙获取 Token 失败（HTTP ' + (response ? response.status : '网络错误') + '，请检查外网域名、HTTPS证书、网络及应用权限）', null);
+      return;
     }
-    return out;
-  }
-  function decode(v) { try { return decodeURIComponent(String(v).replace(/\+/g, '%20')); } catch (e) { return String(v); } }
-  function validPin(v) {
-    v = str(v);
-    if (!v || /^(null|undefined|none)$/i.test(v) || v.length > 128 || /[\r\n\[\]]/.test(v)) return '';
-    return v;
-  }
-  function detectApp(h) {
-    var ua = header(h, 'User-Agent');
-    var pkg = header(h, 'X-Referer-Package');
-    var extra = header(h, 'J-E-C') + ' ' + header(h, 'J-E-H');
-    // 先判断更具体的 Lite 特征，避免被通用 JD UA 提前命中。
-    if (/JDMobileLite|com\.jd\.jdmobilelite/i.test(ua + ' ' + pkg + ' ' + extra)) return 'lite';
-    if (/JD4iPhone|com\.360buy\.jdmobile/i.test(ua + ' ' + pkg + ' ' + extra)) return 'jd';
-    return 'unknown';
-  }
-  function hash(s) {
-    var h = 5381;
-    for (var i = 0; i < String(s).length; i++) h = ((h * 33) ^ String(s).charCodeAt(i)) >>> 0;
-    return ('00000000' + h.toString(16)).slice(-8);
-  }
-  function safeLogResponse(obj, raw) {
-    var code = obj && obj.code !== undefined ? String(obj.code) : '未提供';
-    var msg = obj ? str(obj.message || obj.msg || obj.error) : '';
-    var keys = obj && typeof obj === 'object' ? Object.keys(obj).slice(0, 8).join(',') : '';
-    return '业务code=' + code + (msg ? '，message=' + msg.slice(0, 100) : '') + (keys ? '，响应字段=' + keys : '');
-  }
-  function parseBody(data) {
-    // Loon 不同版本/响应类型下，第三个回调参数可能是文本、对象，
-    // 也可能为空而正文实际挂在 response.body。统一提取真正的 JSON 正文。
-    if (data === null || data === undefined) return null;
-    if (typeof data === 'string') {
-      var raw = data.replace(/^\uFEFF/, '').trim();
-      if (!raw) return null;
-      try { return JSON.parse(raw); } catch (e) { return null; }
-    }
-    if (typeof data === 'object') {
-      if (Array.isArray(data)) return data;
-      if (Object.prototype.hasOwnProperty.call(data, 'code') ||
-          Object.prototype.hasOwnProperty.call(data, 'data') ||
-          Object.prototype.hasOwnProperty.call(data, 'message') ||
-          Object.prototype.hasOwnProperty.call(data, 'msg')) return data;
-      if (typeof data.body === 'string') return parseBody(data.body);
-      if (typeof data.responseText === 'string') return parseBody(data.responseText);
-      if (typeof data.text === 'string') return parseBody(data.text);
-      // 不把 Loon 的空响应包装对象误当成业务 JSON。
-      if (Object.keys(data).length === 0) return null;
-      return data;
-    }
-    return null;
-  }
-  function responseObject(resp, data) {
-    var obj = parseBody(data);
-    if (obj !== null) return obj;
-    if (resp) {
-      obj = parseBody(resp.body);
-      if (obj !== null) return obj;
-      obj = parseBody(resp.data);
-      if (obj !== null) return obj;
-      obj = parseBody(resp.responseText);
-      if (obj !== null) return obj;
-    }
-    return null;
-  }
-  function apiSuccess(httpStatus, obj) {
-    // HTTP 层只判断传输状态及明确的业务失败。青龙 2.19.2 的部分接口
-    // 可能返回不带顶层 code 的 JSON；不能因此误判失败，也不能仅凭 200 宣告成功。
-    if (httpStatus < 200 || httpStatus >= 300 || !obj || typeof obj !== 'object') return false;
-    if (!Object.prototype.hasOwnProperty.call(obj, 'code')) return true; // 仅放行到接口级结构校验；列表/Token/详情均必须有有效数据
-    var code = obj.code;
-    if (code === 200 || code === 0 || code === '200' || code === '0') return true;
-    return false;
-  }
-  function http(method, path, body, token, cb) {
-    var headers = { Accept: 'application/json' };
-    if (token) headers.Authorization = 'Bearer ' + token;
-    if (body !== null && body !== undefined) headers['Content-Type'] = 'application/json';
-    var opt = { url: CFG.base + path, timeout: CFG.timeout, headers: headers, node: 'DIRECT', 'auto-redirect': false, 'auto-cookie': false };
-    if (body !== null && body !== undefined) opt.body = JSON.stringify(body);
-    var fn = String(method).toLowerCase();
-    if (!$httpClient || typeof $httpClient[fn] !== 'function') { cb('Loon HTTP 方法不可用：' + method); return; }
-    $httpClient[fn](opt, function (err, resp, data) {
-      var status = resp ? Number(resp.status || resp.statusCode || 0) : 0;
-      var obj = responseObject(resp, data);
-      if (err) { cb('网络请求失败：' + str(err).slice(0, 120), obj, status); return; }
-      if (!resp) { cb('没有收到 HTTP 响应', obj, status); return; }
-      if (status < 200 || status >= 300) { cb('HTTP ' + status + '；' + safeLogResponse(obj, data), obj, status); return; }
-      if (!apiSuccess(status, obj)) { cb('HTTP ' + status + '，但青龙业务响应未成功；' + safeLogResponse(obj, data), obj, status); return; }
-      cb(null, obj, status);
-    });
-  }
-  function token(cb, retry) {
-    var st = readState(), now = Math.floor(Date.now() / 1000);
-    if (st.token && Number(st.exp || 0) > now + 180) { cb(null, st.token); return; }
-    if (!CFG.base || !/^https?:\/\//i.test(CFG.base) || !CFG.clientId || !CFG.clientSecret) { cb('请在插件参数中填写青龙 HTTPS 地址、Client ID 和 Client Secret'); return; }
-    var path = '/open/auth/token?client_id=' + encodeURIComponent(CFG.clientId) + '&client_secret=' + encodeURIComponent(CFG.clientSecret);
-    http('GET', path, null, null, function (err, obj) {
-      if (err) { cb('获取青龙 Token 失败：' + err); return; }
-      var d = obj && obj.data;
-      if (!d || !d.token) { cb('Token 接口成功响应中没有 data.token'); return; }
-      st.token = String(d.token); st.exp = Number(d.expiration || now + 25 * 86400); saveState(st);
-      cb(null, st.token);
-    });
-  }
-  function ql(method, path, body, cb, retried) {
-    token(function (te, tk) {
-      if (te) { cb(te); return; }
-      http(method, path, body, tk, function (err, obj, status) {
-        if (!retried && (status === 401 || (obj && (obj.code === 401 || obj.code === '401')))) {
-          var st = readState(); delete st.token; delete st.exp; saveState(st);
-          ql(method, path, body, cb, true); return;
-        }
-        cb(err, obj);
-      });
-    });
-  }
-  function arrayData(obj) {
-    if (Array.isArray(obj)) return obj;
-    if (!obj || obj.data === undefined || obj.data === null) return [];
-    if (Array.isArray(obj.data)) return obj.data;
-    if (obj.data && Array.isArray(obj.data.data)) return obj.data.data;
-    if (obj.data && Array.isArray(obj.data.list)) return obj.data.list;
-    if (obj.data && Array.isArray(obj.data.files)) return obj.data.files;
-    if (obj.data && Array.isArray(obj.data.envs)) return obj.data.envs;
-    if (obj.data && Array.isArray(obj.data.items)) return obj.data.items;
-    if (Array.isArray(obj.files)) return obj.files;
-    if (Array.isArray(obj.list)) return obj.list;
-    if (Array.isArray(obj.items)) return obj.items;
-    return [];
-  }
-  function mask(pin) { return pin.length > 4 ? pin.slice(0, 2) + '***' + pin.slice(-2) : '***'; }
-  function envHasPin(name, value, pin) {
-    // JD_COOKIE 使用 pt_pin；JD_WSCK 使用 pin。两者格式不同，必须分别匹配。
-    var key = name === 'JD_WSCK' ? 'pin' : 'pt_pin';
-    var re = new RegExp('(?:^|;)\\s*' + key + '\\s*=\\s*([^;]+)', 'i');
-    var m = String(value || '').match(re);
-    return !!m && decode(m[1].trim()).replace(/^['"]|['"]$/g, '') === pin;
-  }
-  function upsertEnv(name, value, pin, cb) {
-    ql('GET', '/open/envs?searchValue=' + encodeURIComponent(name), null, function (err, obj) {
-      if (err) { cb('查询环境变量 ' + name + ' 失败：' + err); return; }
-      var list = arrayData(obj), found = [];
-      for (var i = 0; i < list.length; i++) {
-        if (list[i] && list[i].name === name && envHasPin(name, list[i].value, pin) && list[i].id !== undefined) found.push(list[i]);
-      }
-      if (found.length) {
-        // 历史上若已有重复的同名同 PIN 项，全部更新，避免保留旧凭据。
-        var index = 0, failed = false;
-        function updateNext() {
-          if (index >= found.length) { cb(failed ? '部分同 PIN 环境变量更新/启用失败' : null, '更新'); return; }
-          var item = found[index++];
-          var payload = { id: item.id, name: name, value: value };
-          if (item.remarks !== undefined) payload.remarks = item.remarks;
-          ql('PUT', '/open/envs', payload, function (e) {
-            if (e) { failed = true; log('更新同 PIN 变量 id=' + item.id + ' 失败：' + e); updateNext(); return; }
-            ql('PUT', '/open/envs/enable', [item.id], function (ee) {
-              if (ee) { failed = true; log('启用变量 id=' + item.id + ' 失败：' + ee); }
-              updateNext();
-            });
-          });
-        }
-        updateNext();
-      } else {
-        ql('POST', '/open/envs', [{ name: name, value: value, remarks: pin }], function (e) {
-          if (e) { cb('新增环境变量 ' + name + ' 失败：' + e); return; }
-          cb(null, '新增');
-        });
-      }
-    });
-  }
-  function patchIni(text, pin, key, value) {
-    // 只改目标 PIN 区段中的目标字段；没有 PIN 则追加新区段；没有字段则在该区段补入。字段写为 key=value，不改写 wskey/jskey 原值。
-    // 其余账号、注释、空行及字段内容保留。使用文件原有主要换行符。
-    text = String(text);
-    var newline = text.indexOf('\r\n') >= 0 ? '\r\n' : (text.indexOf('\r') >= 0 && text.indexOf('\n') < 0 ? '\r' : '\n');
-    var lines = text.split(/\r\n|\n|\r/);
-    var begins = [], i, m;
-    for (i = 0; i < lines.length; i++) {
-      m = lines[i].match(/^\s*\[([^\]]+)\]\s*(?:[;#].*)?$/);
-      if (m && m[1].trim() === pin) begins.push(i);
-    }
-    if (begins.length > 1) throw new Error('jdUser.ini 存在重复 PIN 区段 [' + pin + ']，为避免改错账号已停止');
-    var line = key + '=' + String(value);
-    if (begins.length === 1) {
-      var begin = begins[0], end = lines.length;
-      for (i = begin + 1; i < lines.length; i++) {
-        if (/^\s*\[[^\]]+\]\s*(?:[;#].*)?$/.test(lines[i])) { end = i; break; }
-      }
-      var matches = [], keyRe = new RegExp('^\\s*' + key + '\\s*=', 'i');
-      for (i = begin + 1; i < end; i++) if (keyRe.test(lines[i])) matches.push(i);
-      if (matches.length) {
-        lines[matches[0]] = line;
-        for (i = matches.length - 1; i >= 1; i--) lines.splice(matches[i], 1);
-      } else {
-        var at = end;
-        while (at > begin + 1 && lines[at - 1] === '') at--;
-        lines.splice(at, 0, line);
-      }
-    } else {
-      while (lines.length && lines[lines.length - 1] === '') lines.pop();
-      if (lines.length) lines.push('');
-      lines.push('[' + pin + ']', 'pin=' + pin, line);
-    }
-    return lines.join(newline);
-  }
-  function extractConfigText(obj, depth) {
-    depth = depth || 0;
-    if (typeof obj === 'string') {
-      var t = obj.replace(/^\uFEFF/, '');
-      try { var parsed = JSON.parse(t); if (typeof parsed === 'string') return parsed; } catch (e) {}
-      return t;
-    }
-    if (!obj || typeof obj !== 'object' || depth > 5) return null;
-    var keys = ['content', 'value', 'data', 'body', 'text'];
-    for (var i = 0; i < keys.length; i++) if (Object.prototype.hasOwnProperty.call(obj, keys[i])) {
-      var found = extractConfigText(obj[keys[i]], depth + 1);
-      if (typeof found === 'string') return found;
-    }
-    return null;
-  }
-  function iniHasValue(text, pin, field, value) {
-    var lines = String(text).split(/\r\n|\n|\r/), section = -1, end = lines.length, i, m;
-    for (i = 0; i < lines.length; i++) {
-      m = lines[i].match(/^\s*\[([^\]]+)\]\s*(?:[;#].*)?$/);
-      if (m && m[1].trim() === pin) { section = i; break; }
-    }
-    if (section < 0) return false;
-    for (i = section + 1; i < lines.length; i++) if (/^\s*\[[^\]]+\]\s*(?:[;#].*)?$/.test(lines[i])) { end = i; break; }
-    for (i = section + 1; i < end; i++) {
-      m = lines[i].match(new RegExp('^\\s*' + field + '\\s*=\\s*(.*?)\\s*$', 'i'));
-      if (m) {
-        var actual = m[1].trim().replace(/^"(.*)"$/, '$1').replace(/\\(["\\])/g, '$1');
-        if (actual === String(value)) return true;
-      }
-    }
-    return false;
-  }
-  function updateIni(pin, value, field, cb) {
-    // 不再依赖 /open/configs/files 列表接口。
-    // 青龙 OpenAPI 同时提供 /open/configs/{file} 读取指定配置文件，
-    // 直接读取 jdUser.ini，避免列表响应结构差异导致整个写入流程中断。
-    var path = 'jdUser.ini';
-    var readPath = '/open/configs/' + encodeURIComponent(path);
-    ql('GET', readPath, null, function (e, detail) {
-      if (e) { cb('直接读取 jdUser.ini 失败：' + e); return; }
-      var content = extractConfigText(detail);
-      if (typeof content !== 'string') {
-        cb('青龙未返回 jdUser.ini 字符串正文，已停止写入保护原文件；响应字段=' +
-          (detail && typeof detail === 'object' ? Object.keys(detail).join(',') : typeof detail));
+    var exp = Number(obj.data.expiration || 0);
+    if (!exp) exp = now + 29 * 24 * 3600;
+    writeJSON(STORE.TOKEN, { token: obj.data.token, expiration: exp });
+    callback(null, obj.data.token);
+  });
+}
+function qlRequest(method, path, body, callback, retried) {
+  getToken(function (tokenErr, token) {
+    if (tokenErr) { callback(tokenErr, null); return; }
+    var headers = { 'Accept': 'application/json', 'Authorization': 'Bearer ' + token };
+    http(method, qlBase() + path, body, headers, function (err, response, data) {
+      var obj = parseResponse(data);
+      var status = response ? Number(response.status || response.statusCode || 0) : 0;
+      if (!retried && (status === 401 || (obj && Number(obj.code) === 401))) {
+        clearToken();
+        qlRequest(method, path, body, callback, true);
         return;
       }
-      var changed;
-      try { changed = patchIni(content, pin, field, value); }
-      catch (ex) { cb('解析 jdUser.ini 失败：' + String(ex)); return; }
-      if (changed === content) { cb(null, '已存在相同内容'); return; }
-      ql('POST', '/open/configs/save', { name: path, content: changed }, function (se) {
-        if (se) { cb('保存 jdUser.ini 失败：' + se); return; }
-        // 保存后仍通过指定文件接口回读；未验证目标 PIN/字段前绝不报告成功。
-        ql('GET', readPath, null, function (ve, verify) {
-          if (ve) { cb('保存请求成功，但回读校验失败：' + ve); return; }
-          var saved = extractConfigText(verify);
-          if (typeof saved !== 'string' || !iniHasValue(saved, pin, field, value)) {
-            cb('保存请求已返回成功，但回读未找到目标 PIN 的目标字段，不能确认写入'); return;
-          }
-          cb(null, '写入并回读校验成功');
+      if (!isApiOK(err, response, data)) {
+        var detail = obj && (obj.message || obj.msg) ? (obj.message || obj.msg) : (err || ('HTTP ' + status));
+        callback('青龙 API 失败：' + String(detail).slice(0, 180), obj);
+        return;
+      }
+      callback(null, obj);
+    });
+  });
+}
+function getDataArray(obj) {
+  if (!obj || obj.data === undefined || obj.data === null) return [];
+  if (Array.isArray(obj.data)) return obj.data;
+  if (obj.data.data && Array.isArray(obj.data.data)) return obj.data.data;
+  return [];
+}
+function valueHasPin(value, key, pin) {
+  var segments = String(value || '').split(';'), i, p, k, v;
+  for (i = 0; i < segments.length; i++) {
+    p = segments[i].indexOf('=');
+    if (p < 0) continue;
+    k = segments[i].slice(0, p).trim();
+    v = safeDecode(segments[i].slice(p + 1).trim());
+    if (k === key && v === pin) return true;
+  }
+  return false;
+}
+function upsertEnv(name, value, matchKey, pin, callback) {
+  qlRequest('GET', '/open/envs?searchValue=' + enc(name), null, function (err, obj) {
+    if (err) { callback(err, null); return; }
+    var envs = getDataArray(obj), found = null, i;
+    for (i = 0; i < envs.length; i++) {
+      if (envs[i].name === name && valueHasPin(envs[i].value, matchKey, pin)) { found = envs[i]; break; }
+    }
+    if (found) {
+      var payload = { id: /^\d+$/.test(String(found.id)) ? Number(found.id) : found.id, name: name, value: value };
+      if (found.remarks !== undefined) payload.remarks = found.remarks;
+      qlRequest('PUT', '/open/envs', payload, function (putErr) {
+        if (putErr) { callback(putErr, null); return; }
+        qlRequest('PUT', '/open/envs/enable', [payload.id], function (enableErr) {
+          if (enableErr) { callback('环境变量内容已更新，但启用失败：' + enableErr, null); return; }
+          callback(null, { action: '更新', enabled: true, warning: '' });
         });
       });
+    } else {
+      qlRequest('POST', '/open/envs', [{ name: name, value: value, remarks: pin }], function (postErr) {
+        if (postErr) { callback(postErr, null); return; }
+        callback(null, { action: '新增', enabled: true, warning: '' });
+      });
+    }
+  });
+}
+function iniQuote(value) {
+  var s = String(value);
+  if (/[\s=;#"'\\]/.test(s)) return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+  return s;
+}
+function updateIniText(content, pin, field, value) {
+  var lines = String(content || '').replace(/\r\n/g, '\n').split('\n');
+  var start = -1, end = lines.length, i, section;
+  for (i = 0; i < lines.length; i++) {
+    var m = lines[i].match(/^\s*\[([^\]]+)\]\s*(?:[;#].*)?$/);
+    if (m) {
+      if (start >= 0) { end = i; break; }
+      if (m[1].trim() === pin) start = i;
+    }
+  }
+  var newLine = field + '=' + iniQuote(value);
+  if (start >= 0) {
+    var found = false;
+    for (i = start + 1; i < end; i++) {
+      var kv = lines[i].match(/^(\s*)(wskey|jskey)\s*=/i);
+      if (kv && kv[2].toLowerCase() === field.toLowerCase()) {
+        lines[i] = kv[1] + newLine;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      var insertAt = end;
+      while (insertAt > start + 1 && lines[insertAt - 1] === '') insertAt--;
+      lines.splice(insertAt, 0, newLine);
+    }
+  } else {
+    while (lines.length && lines[lines.length - 1] === '') lines.pop();
+    if (lines.length) lines.push('');
+    lines.push('[' + pin + ']');
+    lines.push('pin=' + iniQuote(pin));
+    lines.push(newLine);
+  }
+  return lines.join('\n').replace(/\n+$/, '') + '\n';
+}
+function updateJdUserIni(pin, wskey, field, callback) {
+  qlRequest('GET', '/open/configs/files', null, function (err, obj) {
+    if (err) { callback('读取青龙配置文件列表失败：' + err); return; }
+    var files = getDataArray(obj), target = null, i;
+    for (i = 0; i < files.length; i++) {
+      if (files[i].title === 'jdUser.ini' || files[i].value === 'jdUser.ini' || String(files[i].value || '').split('/').pop() === 'jdUser.ini') {
+        target = files[i]; break;
+      }
+    }
+    if (!target) { callback('青龙配置文件列表中找不到 jdUser.ini，请确认文件存在及应用有 configs 权限'); return; }
+    var filePath = target.value || target.title;
+    function handleConfigDetail(detailErr, detailObj) {
+      if (detailErr) { callback('读取 jdUser.ini 失败：' + detailErr); return; }
+      var content = detailObj.data;
+      if (content && typeof content === 'object') content = content.content || content.value || '';
+      if (typeof content !== 'string') { callback('青龙返回的 jdUser.ini 内容格式无法识别'); return; }
+      var updated;
+      try { updated = updateIniText(content, pin, field, wskey); }
+      catch (e) { callback('解析 jdUser.ini 失败：' + String(e)); return; }
+      qlRequest('POST', '/open/configs/save', { name: filePath, content: updated }, function (saveErr) {
+        if (saveErr) { callback('保存 jdUser.ini 失败：' + saveErr); return; }
+        callback(null, { action: '写入', field: field });
+      });
+    }
+    qlRequest('GET', '/open/configs/detail?path=' + enc(filePath), null, function (detailErr, detailObj) {
+      // Current Qinglong uses /detail?path=. Some older builds used /configs/:file.
+      // Try the legacy route only when the modern route fails; no other host is contacted.
+      if (detailErr) {
+        var legacyPath = encodeURI(String(filePath).replace(/^\/+/, ''));
+        qlRequest('GET', '/open/configs/' + legacyPath, null, handleConfigDetail);
+      } else handleConfigDetail(null, detailObj);
+    });
+  });
+}
+function localState(app) {
+  var key = STORE.STATE_PREFIX + appKey(app);
+  var s = readJSON(key, { pins: {}, pending: [] });
+  if (!s || typeof s !== 'object') s = { pins: {}, pending: [] };
+  if (!s.pins) s.pins = {};
+  if (!Array.isArray(s.pending)) s.pending = [];
+  return s;
+}
+function saveLocalState(app, s) {
+  var now = Math.floor(Date.now() / 1000), k;
+  for (k in s.pins) if (now - Number(s.pins[k] || 0) > 3600) delete s.pins[k];
+  s.pending = s.pending.filter(function (x) { return now - Number(x.ts || 0) <= CONFIG.PENDING_WSKEY_SECONDS; }).slice(-5);
+  writeJSON(STORE.STATE_PREFIX + appKey(app), s);
+}
+function activePins(s, now) {
+  var out = [], k;
+  for (k in s.pins) if (now - Number(s.pins[k] || 0) <= CONFIG.PIN_LOOKBACK_SECONDS) out.push(k);
+  return out;
+}
+function lastKey(app, kind, pin) { return STORE.LAST_PREFIX + appKey(app) + '_' + kind + '_' + hash8(pin); }
+function dedupeKey(app, kind, pin, credential) { return STORE.DEDUPE_PREFIX + appKey(app) + '_' + kind + '_' + hash8(pin + '|' + credential); }
+function shouldDedupe(key) {
+  var now = Math.floor(Date.now() / 1000), last = Number(readStore(key, '0')) || 0;
+  if (now - last < CONFIG.DEDUPE_SECONDS) return true;
+  writeStore(key, String(now));
+  return false;
+}
+function inCooldown(app, kind, pin) {
+  var v = readJSON(lastKey(app, kind, pin), null), now = Math.floor(Date.now() / 1000);
+  return !!(v && now - Number(v.ts || 0) < CONFIG.COOLDOWN_SECONDS);
+}
+function markSuccess(app, kind, pin, sig, action, target) {
+  writeJSON(lastKey(app, kind, pin), { ts: Math.floor(Date.now() / 1000), sig: sig });
+  var key = STORE.PAIR_PREFIX + appKey(app) + '_' + hash8(pin);
+  var p = readJSON(key, {});
+  p[kind] = { sig: sig, ts: Math.floor(Date.now() / 1000), action: action, target: target || '' };
+  writeJSON(key, p);
+  maybeNotifyPair(app, pin, key, p);
+}
+function maybeNotifyPair(app, pin, key, p) {
+  var now = Math.floor(Date.now() / 1000), ck = p.ck, ws = p.wskey;
+  if (!ck || !ws || now - Number(ck.ts || 0) > CONFIG.PAIR_WINDOW_SECONDS || now - Number(ws.ts || 0) > CONFIG.PAIR_WINDOW_SECONDS) return;
+  var sig = ck.sig + '|' + ws.sig;
+  var prevSig = p.notifiedSig || '', prevAt = Number(p.notifiedAt || 0);
+  if (prevAt && now - prevAt < CONFIG.NOTIFY_REPEAT_SECONDS) {
+    if (prevSig === sig) return;
+    var old = prevSig.split('|');
+    if (old.length === 2 && (old[0] === ck.sig || old[1] === ws.sig)) return;
+  }
+  p.notifiedSig = sig;
+  p.notifiedAt = now;
+  writeJSON(key, p);
+  var pinText = String(pin).length > 4 ? String(pin).slice(0, 2) + '***' + String(pin).slice(-2) : String(pin);
+  notify(APP_NAMES[app] + ' CK + wskey 同步成功', 'PIN: ' + pinText,
+    '✅ pt_key → JD_COOKIE（' + ck.action + '）\n✅ wskey → ' + ws.target + '（' + ws.action + '）');
+}
+function failOnce(app, key, message) {
+  var k = STORE.FAIL_PREFIX + appKey(app) + '_' + hash8(key);
+  var now = Math.floor(Date.now() / 1000), last = Number(readStore(k, '0')) || 0;
+  if (now - last < CONFIG.NOTIFY_FAILURE_SECONDS) return;
+  writeStore(k, String(now));
+  notify(APP_NAMES[app] + ' 同步失败', '请检查 Loon / 网络 / 青龙', message);
+}
+function uploadCookie(app, pin, ptKey, callback) {
+  if ((app === 'lite' && !CONFIG.UPLOAD_LITE_COOKIE) || (app === 'jd' && !CONFIG.UPLOAD_JD_COOKIE)) { callback(null, { skipped: true, disabled: true }); return; }
+  var value = 'pt_key=' + ptKey + ';pt_pin=' + pin + ';';
+  var sig = hash8(value), key = dedupeKey(app, 'ck', pin, value);
+  if (shouldDedupe(key)) { callback(null, { skipped: true }); return; }
+  if (inCooldown(app, 'ck', pin)) { callback(null, { skipped: true, cooldown: true }); return; }
+  upsertEnv('JD_COOKIE', value, 'pt_pin', pin, function (err, result) {
+    if (err) { removeStore(key); callback(err); return; }
+    markSuccess(app, 'ck', pin, sig, result.action, 'JD_COOKIE');
+    log(APP_NAMES[app] + ' JD_COOKIE ' + result.action + '成功，PIN=' + pinMask(pin));
+    callback(null, result);
+  });
+}
+function wskeyUploadEnabled(app) {
+  return app === 'lite'
+    ? CONFIG.UPLOAD_LITE_INI_JSKEY
+    : (CONFIG.UPLOAD_JD_WSCK || CONFIG.UPLOAD_JD_INI_WSKEY);
+}
+function uploadWskey(app, pin, wskey, callback) {
+  var doEnv = app === 'jd' && CONFIG.UPLOAD_JD_WSCK;
+  var doIni = app === 'lite' ? CONFIG.UPLOAD_LITE_INI_JSKEY : CONFIG.UPLOAD_JD_INI_WSKEY;
+  if (!doEnv && !doIni) { callback(null, { skipped: true, disabled: true }); return; }
+  var field = app === 'lite' ? 'jskey' : 'wskey';
+  var sig = hash8(wskey), key = dedupeKey(app, 'ws', pin, wskey);
+  if (shouldDedupe(key)) { callback(null, { skipped: true }); return; }
+  if (inCooldown(app, 'ws', pin)) { callback(null, { skipped: true, cooldown: true }); return; }
+
+  var completed = [];
+  function finish(err) {
+    if (err) { removeStore(key); callback(err); return; }
+    var target = completed.join(' + ');
+    markSuccess(app, 'wskey', pin, sig, '写入', target);
+    log(APP_NAMES[app] + ' wskey 写入 ' + target + ' 成功，PIN=' + pinMask(pin));
+    callback(null, { action: '写入', target: target });
+  }
+  function saveIni(next) {
+    if (!doIni) { next(null); return; }
+    updateJdUserIni(pin, wskey, field, function (iniErr) {
+      if (iniErr) { next(iniErr); return; }
+      completed.push('jdUser.ini[' + field + ']');
+      next(null);
     });
   }
-  function process(app, creds, cb) {
-    var pin = validPin(creds.pt_pin), ptKey = str(creds.pt_key), wskey = str(creds.wskey);
-    var st = readState(), now = Math.floor(Date.now() / 1000);
-    st.pins = st.pins || {}; st.pending = st.pending || {}; st.done = st.done || {};
-    var appId = app + ':' + CFG.device;
-    st.pins[appId] = st.pins[appId] || {};
-    st.pending[appId] = st.pending[appId] || [];
-    // 先保存 PIN 观察记录，不依赖 JD_COOKIE 上传开关。
-    if (pin) st.pins[appId][pin] = now;
-    var active = [];
-    Object.keys(st.pins[appId]).forEach(function (p) {
-      if (now - Number(st.pins[appId][p]) <= CFG.pinRecentSec) active.push(p);
-      else delete st.pins[appId][p];
+  function saveEnv() {
+    if (!doEnv) { saveIni(finish); return; }
+    var envValue = 'pin=' + pin + ';wskey=' + wskey + ';';
+    upsertEnv('JD_WSCK', envValue, 'pin', pin, function (err) {
+      if (err) { finish(err); return; }
+      completed.push('JD_WSCK');
+      saveIni(finish);
     });
-    if (wskey && !pin) {
-      if (active.length === 1) pin = active[0];
+  }
+  saveEnv();
+}
+function pinMask(pin) {
+  var s = String(pin || '');
+  return s.length > 4 ? s.slice(0, 2) + '***' + s.slice(-2) : s;
+}
+function testConnection() {
+  if (!/^https?:\/\//i.test(CONFIG.QL_URL)) { log('请填写正确的 QL_URL'); done(); return; }
+  getToken(function (err, token) {
+    if (err) { log(err); notify('京东直连青龙测试失败', '', err); done(); return; }
+    qlRequest('GET', '/open/envs?searchValue=JD_COOKIE', null, function (envErr, envObj) {
+      if (envErr) { log(envErr); notify('京东直连青龙测试失败', '', envErr); done(); return; }
+      qlRequest('GET', '/open/configs/files', null, function (cfgErr, cfgObj) {
+        if (cfgErr) { log('环境变量权限正常，但配置文件权限/接口异常：' + cfgErr); notify('青龙部分权限测试失败', '', cfgErr); done(); return; }
+        var files = getDataArray(cfgObj), hasIni = files.some(function (f) { return f.title === 'jdUser.ini' || f.value === 'jdUser.ini' || String(f.value || '').split('/').pop() === 'jdUser.ini'; });
+        var msg = '青龙 API 连接成功；envs 权限正常；configs 权限正常；' + (hasIni ? '已找到 jdUser.ini' : '未找到 jdUser.ini（请先确认配置文件存在）');
+        log(msg);
+        notify('京东直连青龙连接测试', '连接成功', msg);
+        done();
+      });
+    });
+  });
+}
+function main() {
+  if (!CONFIG.QL_URL || /替换/.test(CONFIG.CLIENT_ID) || /替换/.test(CONFIG.CLIENT_SECRET)) {
+    log('请先在插件参数中填写青龙外网地址、Client ID、Client Secret');
+    done(); return;
+  }
+  if (typeof $request === 'undefined' || !$request || !$request.headers) { testConnection(); return; }
+  var url = String($request.url || '');
+  if (!/^https?:\/\/(?:[^/]+\.)?jd\.com\//i.test(url)) { done(); return; }
+  var headers = $request.headers;
+  var cookie = headerValue(headers, 'Cookie');
+  if (!cookie) { done(); return; }
+  var ptKey = cookieValue(cookie, 'pt_key');
+  var ptPin = validPin(cookieValue(cookie, 'pt_pin'));
+  var wskey = cookieValue(cookie, 'wskey');
+  if (!ptKey && !ptPin && !wskey) { done(); return; }
+  if (!ptPin) ptKey = '';
+  var app = detectApp(headers);
+  if ((app === 'jd' && !CONFIG.CAPTURE_JD) || (app === 'lite' && !CONFIG.CAPTURE_LITE)) { done(); return; }
+  var now = Math.floor(Date.now() / 1000);
+  var state = localState(app), targetPin = '';
+
+  // Match original behavior: wskey without a pin may use a unique recent pin from the same app/device.
+  if (wskey && wskeyUploadEnabled(app)) {
+    if (ptPin) targetPin = ptPin;
+    else {
+      var candidates = activePins(state, now);
+      if (candidates.length === 1) targetPin = candidates[0];
       else {
-        st.pending[appId].push({ value: wskey, ts: now });
-        st.pending[appId] = st.pending[appId].filter(function (x) { return now - x.ts <= CFG.pendingSec; }).slice(-4);
-        saveState(st);
-        log(appName(app) + ' 捕获到 wskey，但当前无法唯一确定 PIN，已暂存 5 分钟；不会猜账号');
-        cb(null); return;
+        state.pending.push({ wskey: wskey, ts: now });
+        saveLocalState(app, state);
+        log(APP_NAMES[app] + ' 捕获到 wskey，但无法安全确定 PIN，已在本机暂存 5 分钟；不会猜账号');
+        done(); return;
       }
     }
-    if (pin && !wskey && st.pending[appId].length) {
-      st.pending[appId] = st.pending[appId].filter(function (x) { return now - x.ts <= CFG.pendingSec; });
-      if (st.pending[appId].length === 1 && active.length <= 1) wskey = st.pending[appId].shift().value;
-      else if (st.pending[appId].length > 1) log('存在多条待配对 wskey，安全起见不自动配对');
-    }
-    saveState(st);
-    if (!pin) { cb(null); return; }
-
-    var tasks = [];
-    if (app === 'jd' && CFG.jdCookie && ptKey) tasks.push({ id: 'JD_COOKIE', run: function (next) { upsertEnv('JD_COOKIE', 'pt_key=' + ptKey + ';pt_pin=' + pin + ';', pin, next); } });
-    if (app === 'lite' && CFG.liteCookie && ptKey) tasks.push({ id: 'JD_COOKIE', run: function (next) { upsertEnv('JD_COOKIE', 'pt_key=' + ptKey + ';pt_pin=' + pin + ';', pin, next); } });
-    if (app === 'jd' && wskey && CFG.jdWsck) tasks.push({ id: 'JD_WSCK', run: function (next) { upsertEnv('JD_WSCK', 'pin=' + pin + ';wskey=' + wskey + ';', pin, next); } });
-    if (app === 'jd' && wskey && CFG.jdIni) tasks.push({ id: 'jdUser.ini[wskey]', run: function (next) { updateIni(pin, wskey, 'wskey', next); } });
-    if (app === 'lite' && wskey && CFG.liteIni) tasks.push({ id: 'jdUser.ini[jskey]', run: function (next) { updateIni(pin, wskey, 'jskey', next); } });
-
-    if (!tasks.length) {
-      if (wskey) log(appName(app) + ' 检测到 wskey，但对应写入开关关闭');
-      cb(null); return;
-    }
-    var errors = [], idx = 0;
-    function nextTask() {
-      if (idx >= tasks.length) {
-        if (errors.length) {
-          log(appName(app) + ' 同步存在失败：' + errors.join('；'));
-          notify('京东同步失败', appName(app) + ' / PIN ' + mask(pin), errors.join('\n'));
-        }
-        cb(errors.length ? errors.join('；') : null); return;
+  } else if (!wskey && ptPin && wskeyUploadEnabled(app)) {
+    // Original server consumes a pending wskey on a later pin-bearing request, only when unambiguous.
+    var currentPins = activePins(state, now);
+    if (currentPins.length <= 1 && state.pending.length) {
+      state.pending = state.pending.filter(function (x) { return now - Number(x.ts || 0) <= CONFIG.PENDING_WSKEY_SECONDS; });
+      if (state.pending.length === 1) {
+        wskey = state.pending.shift().wskey;
+        targetPin = ptPin;
+      } else if (state.pending.length > 1) {
+        log('同一 App 有多条待配对 wskey，为防止串号，本次不自动配对');
       }
-      var task = tasks[idx++];
-      task.run(function (e, action) {
-        if (e) { errors.push(task.id + '：' + e); log(task.id + ' 失败：' + e); }
-        else log(appName(app) + ' ' + task.id + ' 成功' + (action ? '（' + action + '）' : '') + '，PIN=' + mask(pin));
-        nextTask();
-      });
     }
-    nextTask();
   }
-  function appName(a) { return a === 'lite' ? '京东特价版' : '京东主 App'; }
-  function runTest() {
-    if (!CFG.base || !CFG.clientId || !CFG.clientSecret) { log('请填写青龙连接参数'); finish(); return; }
-    ql('GET', '/open/envs?searchValue=JD_COOKIE', null, function (e) {
-      if (e) { log('青龙环境变量接口测试失败：' + e); finish(); return; }
-      ql('GET', '/open/configs/' + encodeURIComponent('jdUser.ini'), null, function (ce, obj) {
-        if (ce) { log('环境变量权限正常；直接读取 jdUser.ini 失败：' + ce); finish(); return; }
-        var content = extractConfigText(obj);
-        log(typeof content === 'string' ? '连接测试通过：Token、envs、jdUser.ini 读取均正常' : 'Token、envs 正常，但 jdUser.ini 响应没有字符串正文；响应字段=' + (obj && typeof obj === 'object' ? Object.keys(obj).join(',') : typeof obj));
-        finish();
-      });
+
+  // Store pin timestamp after pending resolution, matching the source server's order.
+  if (ptPin) state.pins[ptPin] = now;
+  saveLocalState(app, state);
+
+  var jobs = [];
+  if (ptKey && ptPin && ((app === 'jd' && CONFIG.UPLOAD_JD_COOKIE) || (app === 'lite' && CONFIG.UPLOAD_LITE_COOKIE))) jobs.push(function (next) { uploadCookie(app, ptPin, ptKey, next); });
+  if (wskey && targetPin && wskeyUploadEnabled(app)) jobs.push(function (next) { uploadWskey(app, targetPin, wskey, next); });
+  if (wskey && !targetPin) log('wskey 暂存等待 PIN；未上传青龙');
+  if (!jobs.length) { done(); return; }
+
+  var errors = [];
+  function runNext(index) {
+    if (index >= jobs.length) {
+      if (errors.length) {
+        var msg = errors.join('；');
+        log(APP_NAMES[app] + ' 同步失败：' + msg);
+        failOnce(app, (ptPin || targetPin || 'unknown') + '|' + msg, msg);
+      }
+      done(); return;
+    }
+    jobs[index](function (err) {
+      if (err) errors.push(String(err));
+      runNext(index + 1);
     });
   }
+  runNext(0);
+}
 
-  try {
-    if (typeof $request === 'undefined' || !$request || !$request.url) { runTest(); return; }
-    var url = str($request.url);
-    if (!/^https?:\/\/(?:[^/]+\.)?jd\.com\//i.test(url)) { finish(); return; }
-    var h = $request.headers || {};
-    var app = detectApp(h);
-    if (app === 'unknown') { finish(); return; }
-    if ((app === 'jd' && !CFG.captureJD) || (app === 'lite' && !CFG.captureLite)) { finish(); return; }
-    var c = cookieMap(h);
-    var creds = { pt_key: c.pt_key || '', pt_pin: c.pt_pin || '', wskey: c.wskey || '' };
-    var hasCookie = !!(creds.pt_key || creds.pt_pin || creds.wskey);
-    if (!hasCookie) { finish(); return; }
-    // 即使 Cookie 上传关闭，仍处理 PIN/WSKEY 识别与配对，确保各写入开关真正独立。
-    log(appName(app) + ' 请求命中；pt_key=' + (creds.pt_key ? '有' : '无') + '；pt_pin=' + (validPin(creds.pt_pin) ? '有' : '无') + '；wskey=' + (creds.wskey ? '有' : '无'));
-    process(app, creds, function () { finish(); });
-  } catch (e) {
-    log('脚本异常：' + String(e).slice(0, 180)); finish();
-  }
-})();
+main();
