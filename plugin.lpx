@@ -1,0 +1,29 @@
+#!name = 京东CK自动同步-青龙直连
+#!desc = 分别控制主App/特价版捕获，以及各凭证变量上传到青龙
+#!author = Custom
+#!homepage = https://github.com/你的GitHub用户名/jd-loon-qinglong
+#!loon_version = 3.5.1(983)
+#!date = 2026-11-19
+#!tag = 京东,青龙,自动同步
+
+[Argument]
+ql_url = input,"https://你的青龙外网域名",type=string,tag=青龙外网地址,desc=填写青龙外网根地址，不要在末尾加斜杠
+client_id = input,"",type=string,tag=青龙Client ID
+client_secret = input,"",type=string,tag=青龙Client Secret
+device_tag = input,"iphone-main",type=string,tag=设备标识,desc=每台iPhone使用不同标识
+
+capture_jd = switch,true,type=boolean,tag=捕获京东主App,desc=关闭后忽略主App请求
+capture_lite = switch,true,type=boolean,tag=捕获京东特价版,desc=关闭后忽略特价版请求
+
+upload_jd_cookie = switch,true,type=boolean,tag=主App-上传JD_COOKIE
+upload_jd_wsck = switch,true,type=boolean,tag=主App-上传JD_WSCK
+upload_jd_ini_wskey = switch,true,type=boolean,tag=主App-写入jdUser.ini的wskey
+upload_lite_cookie = switch,true,type=boolean,tag=特价版-上传JD_COOKIE
+upload_lite_ini_jskey = switch,true,type=boolean,tag=特价版-写入jdUser.ini的jskey
+
+[Script]
+request if ${url} ~= /^https?:\/\/(?:[^/]+\.)?jd\.com\//i then script("https://raw.githubusercontent.com/你的GitHub用户名/jd-loon-qinglong/main/jd_to_qinglong_loon.js", {${ql_url}, ${client_id}, ${client_secret}, ${device_tag}, ${capture_jd}, ${capture_lite}, ${upload_jd_cookie}, ${upload_jd_wsck}, ${upload_jd_ini_wskey}, ${upload_lite_cookie}, ${upload_lite_ini_jskey}}) with tag="京东CK自动同步", timeout=60
+generic then script("https://raw.githubusercontent.com/你的GitHub用户名/jd-loon-qinglong/main/jd_to_qinglong_loon.js", {${ql_url}, ${client_id}, ${client_secret}, ${device_tag}, ${capture_jd}, ${capture_lite}, ${upload_jd_cookie}, ${upload_jd_wsck}, ${upload_jd_ini_wskey}, ${upload_lite_cookie}, ${upload_lite_ini_jskey}}) with tag="京东青龙连接测试", timeout=60
+
+[Mitm]
+hostname = *.jd.com, jd.com
