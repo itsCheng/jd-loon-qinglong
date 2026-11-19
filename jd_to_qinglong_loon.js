@@ -5,22 +5,15 @@
  *   JD Lite app: pt_key -> JD_COOKIE; wskey -> jdUser.ini[jskey] only
  * No PHP relay, no external telemetry, no third-party upload endpoint.
  *
- * Credentials are injected from the Loon plugin [Argument] section.
+ * IMPORTANT: Fill QL_URL / CLIENT_ID / CLIENT_SECRET before enabling.
  */
 
 var CONFIG = {
-  QL_URL: '', // supplied by Loon plugin [Argument]
+  QL_URL: 'https://你的青龙外网域名', // Public HTTPS domain; no trailing slash
   // Public-domain mode: force Qinglong API requests to DIRECT (no proxy node).
-  CLIENT_ID: '',
-  CLIENT_SECRET: '',
-  DEVICE_TAG: 'iphone-main',
-  CAPTURE_JD: true,
-  CAPTURE_LITE: true,
-  UPLOAD_JD_COOKIE: true,
-  UPLOAD_JD_WSCK: true,
-  UPLOAD_JD_INI_WSKEY: true,
-  UPLOAD_LITE_COOKIE: true,
-  UPLOAD_LITE_INI_JSKEY: true,
+  CLIENT_ID: '替换为青龙应用Client_ID',
+  CLIENT_SECRET: '替换为青龙应用Client_Secret',
+  DEVICE_TAG: 'iphone-main',       // One stable label per phone; change for another phone
   TIMEOUT_MS: 15000,
   DEDUPE_SECONDS: 30,
   COOLDOWN_SECONDS: 60,
@@ -29,6 +22,9 @@ var CONFIG = {
   PAIR_WINDOW_SECONDS: 300,
   NOTIFY_REPEAT_SECONDS: 600,
   NOTIFY_FAILURE_SECONDS: 60,
+  // Main JD app wskey destinations can be enabled independently.
+  SYNC_JD_WSCK: true,
+  SYNC_JDUSER_INI: true,
   LOG_VERBOSE: false
 };
 
@@ -43,22 +39,6 @@ var STORE = {
 
 var APP_NAMES = { jd: '京东主App', lite: '京东特价版' };
 var finished = false;
-
-// Loon plugin passes these values through $argument; credentials are not stored in this public JS file.
-(function applyPluginArguments() {
-  var a = (typeof $argument === 'object' && $argument) ? $argument : {};
-  if (a.ql_url !== undefined && a.ql_url !== null) CONFIG.QL_URL = String(a.ql_url).trim();
-  if (a.client_id !== undefined && a.client_id !== null) CONFIG.CLIENT_ID = String(a.client_id).trim();
-  if (a.client_secret !== undefined && a.client_secret !== null) CONFIG.CLIENT_SECRET = String(a.client_secret).trim();
-  if (a.device_tag !== undefined && a.device_tag !== null && String(a.device_tag).trim()) CONFIG.DEVICE_TAG = String(a.device_tag).trim();
-  if (a.capture_jd !== undefined) CONFIG.CAPTURE_JD = a.capture_jd === true;
-  if (a.capture_lite !== undefined) CONFIG.CAPTURE_LITE = a.capture_lite === true;
-  if (a.upload_jd_cookie !== undefined) CONFIG.UPLOAD_JD_COOKIE = a.upload_jd_cookie === true;
-  if (a.upload_jd_wsck !== undefined) CONFIG.UPLOAD_JD_WSCK = a.upload_jd_wsck === true;
-  if (a.upload_jd_ini_wskey !== undefined) CONFIG.UPLOAD_JD_INI_WSKEY = a.upload_jd_ini_wskey === true;
-  if (a.upload_lite_cookie !== undefined) CONFIG.UPLOAD_LITE_COOKIE = a.upload_lite_cookie === true;
-  if (a.upload_lite_ini_jskey !== undefined) CONFIG.UPLOAD_LITE_INI_JSKEY = a.upload_lite_ini_jskey === true;
-})();
 
 function log(message) {
   console.log('[JD→青龙] ' + message);
@@ -268,7 +248,7 @@ function updateIniText(content, pin, field, value) {
       if (m[1].trim() === pin) start = i;
     }
   }
-  var newLine = field + '=' + iniQuote(value);
+  var newLine = field + ' = ' + iniQuote(value);
   if (start >= 0) {
     var found = false;
     for (i = start + 1; i < end; i++) {
@@ -288,7 +268,7 @@ function updateIniText(content, pin, field, value) {
     while (lines.length && lines[lines.length - 1] === '') lines.pop();
     if (lines.length) lines.push('');
     lines.push('[' + pin + ']');
-    lines.push('pin=' + iniQuote(pin));
+    lines.push('pin = ' + iniQuote(pin));
     lines.push(newLine);
   }
   return lines.join('\n').replace(/\n+$/, '') + '\n';
@@ -327,18 +307,37 @@ function updateJdUserIni(pin, wskey, field, callback) {
     });
   });
 }
+function normalizePendingWskeys(pending, now) {
+  var out = [], i, item, value, ts, found;
+  if (!Array.isArray(pending)) return out;
+  for (i = 0; i < pending.length; i++) {
+    item = pending[i];
+    if (!item || item.wskey === null || item.wskey === undefined) continue;
+    value = String(item.wskey);
+    ts = Number(item.ts || 0);
+    if (!value || !ts || now - ts > CONFIG.PENDING_WSKEY_SECONDS || ts > now + 60) continue;
+    found = -1;
+    for (var j = 0; j < out.length; j++) {
+      if (out[j].wskey === value) { found = j; break; }
+    }
+    if (found >= 0) {
+      if (ts > out[found].ts) out[found].ts = ts;
+    } else out.push({ wskey: value, ts: ts });
+  }
+  return out.slice(-5);
+}
 function localState(app) {
   var key = STORE.STATE_PREFIX + appKey(app);
   var s = readJSON(key, { pins: {}, pending: [] });
   if (!s || typeof s !== 'object') s = { pins: {}, pending: [] };
-  if (!s.pins) s.pins = {};
-  if (!Array.isArray(s.pending)) s.pending = [];
+  if (!s.pins || typeof s.pins !== 'object') s.pins = {};
+  s.pending = normalizePendingWskeys(s.pending, Math.floor(Date.now() / 1000));
   return s;
 }
 function saveLocalState(app, s) {
   var now = Math.floor(Date.now() / 1000), k;
   for (k in s.pins) if (now - Number(s.pins[k] || 0) > 3600) delete s.pins[k];
-  s.pending = s.pending.filter(function (x) { return now - Number(x.ts || 0) <= CONFIG.PENDING_WSKEY_SECONDS; }).slice(-5);
+  s.pending = normalizePendingWskeys(s.pending, now);
   writeJSON(STORE.STATE_PREFIX + appKey(app), s);
 }
 function activePins(s, now) {
@@ -359,12 +358,21 @@ function inCooldown(app, kind, pin) {
   return !!(v && now - Number(v.ts || 0) < CONFIG.COOLDOWN_SECONDS);
 }
 function markSuccess(app, kind, pin, sig, action, target) {
-  writeJSON(lastKey(app, kind, pin), { ts: Math.floor(Date.now() / 1000), sig: sig });
+  var now = Math.floor(Date.now() / 1000);
+  writeJSON(lastKey(app, kind, pin), { ts: now, sig: sig });
   var key = STORE.PAIR_PREFIX + appKey(app) + '_' + hash8(pin);
   var p = readJSON(key, {});
-  p[kind] = { sig: sig, ts: Math.floor(Date.now() / 1000), action: action, target: target || '' };
+  p[kind] = { sig: sig, ts: now, action: action, target: target || '' };
   writeJSON(key, p);
-  maybeNotifyPair(app, pin, key, p);
+
+  // Notify each credential independently, immediately after its own upload completes.
+  // Cookie and wskey no longer need to arrive as a pair before the user is notified.
+  var pinText = pinMask(pin);
+  var isCookie = kind === 'ck';
+  var title = APP_NAMES[app] + (isCookie ? ' Cookie同步成功' : ' wskey同步成功');
+  var subtitle = 'PIN: ' + pinText;
+  var detail = (target || (isCookie ? 'JD_COOKIE' : 'wskey')) + '（' + (action || '写入') + '成功）';
+  notify(title, subtitle, '✅ ' + detail);
 }
 function maybeNotifyPair(app, pin, key, p) {
   var now = Math.floor(Date.now() / 1000), ck = p.ck, ws = p.wskey;
@@ -391,7 +399,6 @@ function failOnce(app, key, message) {
   notify(APP_NAMES[app] + ' 同步失败', '请检查 Loon / 网络 / 青龙', message);
 }
 function uploadCookie(app, pin, ptKey, callback) {
-  if ((app === 'lite' && !CONFIG.UPLOAD_LITE_COOKIE) || (app === 'jd' && !CONFIG.UPLOAD_JD_COOKIE)) { callback(null, { skipped: true, disabled: true }); return; }
   var value = 'pt_key=' + ptKey + ';pt_pin=' + pin + ';';
   var sig = hash8(value), key = dedupeKey(app, 'ck', pin, value);
   if (shouldDedupe(key)) { callback(null, { skipped: true }); return; }
@@ -403,46 +410,59 @@ function uploadCookie(app, pin, ptKey, callback) {
     callback(null, result);
   });
 }
-function wskeyUploadEnabled(app) {
-  return app === 'lite'
-    ? CONFIG.UPLOAD_LITE_INI_JSKEY
-    : (CONFIG.UPLOAD_JD_WSCK || CONFIG.UPLOAD_JD_INI_WSKEY);
-}
 function uploadWskey(app, pin, wskey, callback) {
-  var doEnv = app === 'jd' && CONFIG.UPLOAD_JD_WSCK;
-  var doIni = app === 'lite' ? CONFIG.UPLOAD_LITE_INI_JSKEY : CONFIG.UPLOAD_JD_INI_WSKEY;
-  if (!doEnv && !doIni) { callback(null, { skipped: true, disabled: true }); return; }
-  var field = app === 'lite' ? 'jskey' : 'wskey';
-  var sig = hash8(wskey), key = dedupeKey(app, 'ws', pin, wskey);
+  var key = dedupeKey(app, 'ws', pin, wskey);
   if (shouldDedupe(key)) { callback(null, { skipped: true }); return; }
   if (inCooldown(app, 'ws', pin)) { callback(null, { skipped: true, cooldown: true }); return; }
 
-  var completed = [];
-  function finish(err) {
-    if (err) { removeStore(key); callback(err); return; }
-    var target = completed.join(' + ');
-    markSuccess(app, 'wskey', pin, sig, '写入', target);
-    log(APP_NAMES[app] + ' wskey 写入 ' + target + ' 成功，PIN=' + pinMask(pin));
-    callback(null, { action: '写入', target: target });
+  // Each destination is an independent sync target. A disabled or failed target
+  // must never prevent another enabled target from being attempted or notified.
+  var tasks = [];
+  if (app === 'lite') {
+    tasks.push({ field: 'jskey', target: 'jdUser.ini[jskey]' });
+  } else {
+    if (CONFIG.SYNC_JD_WSCK) tasks.push({ type: 'env', target: 'JD_WSCK' });
+    if (CONFIG.SYNC_JDUSER_INI) tasks.push({ field: 'wskey', target: 'jdUser.ini[wskey]' });
   }
-  function saveIni(next) {
-    if (!doIni) { next(null); return; }
-    updateJdUserIni(pin, wskey, field, function (iniErr) {
-      if (iniErr) { next(iniErr); return; }
-      completed.push('jdUser.ini[' + field + ']');
-      next(null);
-    });
+  if (!tasks.length) {
+    log(APP_NAMES[app] + ' wskey 同步目标均已关闭，跳过');
+    callback(null, { skipped: true, disabled: true });
+    return;
   }
-  function saveEnv() {
-    if (!doEnv) { saveIni(finish); return; }
-    var envValue = 'pin=' + pin + ';wskey=' + wskey + ';';
-    upsertEnv('JD_WSCK', envValue, 'pin', pin, function (err) {
-      if (err) { finish(err); return; }
-      completed.push('JD_WSCK');
-      saveIni(finish);
-    });
+
+  var sig = hash8(wskey), errors = [], completed = 0;
+  function finishOne() {
+    completed++;
+    if (completed < tasks.length) return;
+    if (errors.length) {
+      removeStore(key);
+      callback(errors.join('；'));
+    } else {
+      callback(null, { action: '写入', targets: tasks.map(function (t) { return t.target; }) });
+    }
   }
-  saveEnv();
+  function success(task, action) {
+    // Notify immediately for this destination only; no dependency on other targets.
+    markSuccess(app, 'wskey', pin, sig, action || '写入', task.target);
+    log(APP_NAMES[app] + ' wskey 目标 ' + task.target + ' 同步成功，PIN=' + pinMask(pin));
+    finishOne();
+  }
+  tasks.forEach(function (task) {
+    if (task.type === 'env') {
+      var envValue = 'pin=' + pin + ';wskey=' + wskey + ';';
+      upsertEnv('JD_WSCK', envValue, 'pin', pin, function (err, result) {
+        if (err) errors.push('JD_WSCK：' + err);
+        else success(task, result.action);
+        if (err) finishOne();
+      });
+    } else {
+      updateJdUserIni(pin, wskey, task.field, function (err, result) {
+        if (err) errors.push(task.target + '：' + err);
+        else success(task, result.action);
+        if (err) finishOne();
+      });
+    }
+  });
 }
 function pinMask(pin) {
   var s = String(pin || '');
@@ -467,7 +487,7 @@ function testConnection() {
 }
 function main() {
   if (!CONFIG.QL_URL || /替换/.test(CONFIG.CLIENT_ID) || /替换/.test(CONFIG.CLIENT_SECRET)) {
-    log('请先在插件参数中填写青龙外网地址、Client ID、Client Secret');
+    log('请先编辑脚本顶部 CONFIG：QL_URL、CLIENT_ID、CLIENT_SECRET');
     done(); return;
   }
   if (typeof $request === 'undefined' || !$request || !$request.headers) { testConnection(); return; }
@@ -481,25 +501,33 @@ function main() {
   var wskey = cookieValue(cookie, 'wskey');
   if (!ptKey && !ptPin && !wskey) { done(); return; }
   if (!ptPin) ptKey = '';
-  var app = detectApp(headers);
-  if ((app === 'jd' && !CONFIG.CAPTURE_JD) || (app === 'lite' && !CONFIG.CAPTURE_LITE)) { done(); return; }
-  var now = Math.floor(Date.now() / 1000);
+  var app = detectApp(headers), now = Math.floor(Date.now() / 1000);
   var state = localState(app), targetPin = '';
 
   // Match original behavior: wskey without a pin may use a unique recent pin from the same app/device.
-  if (wskey && wskeyUploadEnabled(app)) {
+  if (wskey) {
     if (ptPin) targetPin = ptPin;
     else {
       var candidates = activePins(state, now);
       if (candidates.length === 1) targetPin = candidates[0];
       else {
-        state.pending.push({ wskey: wskey, ts: now });
+        // Multiple requests can carry the same wskey. Refresh its timestamp instead
+        // of creating duplicate pending entries; distinct wskeys remain separate.
+        var pendingFound = false;
+        for (var pi = 0; pi < state.pending.length; pi++) {
+          if (state.pending[pi].wskey === wskey) {
+            state.pending[pi].ts = now;
+            pendingFound = true;
+            break;
+          }
+        }
+        if (!pendingFound) state.pending.push({ wskey: wskey, ts: now });
         saveLocalState(app, state);
         log(APP_NAMES[app] + ' 捕获到 wskey，但无法安全确定 PIN，已在本机暂存 5 分钟；不会猜账号');
         done(); return;
       }
     }
-  } else if (!wskey && ptPin && wskeyUploadEnabled(app)) {
+  } else if (ptPin) {
     // Original server consumes a pending wskey on a later pin-bearing request, only when unambiguous.
     var currentPins = activePins(state, now);
     if (currentPins.length <= 1 && state.pending.length) {
@@ -518,8 +546,8 @@ function main() {
   saveLocalState(app, state);
 
   var jobs = [];
-  if (ptKey && ptPin && ((app === 'jd' && CONFIG.UPLOAD_JD_COOKIE) || (app === 'lite' && CONFIG.UPLOAD_LITE_COOKIE))) jobs.push(function (next) { uploadCookie(app, ptPin, ptKey, next); });
-  if (wskey && targetPin && wskeyUploadEnabled(app)) jobs.push(function (next) { uploadWskey(app, targetPin, wskey, next); });
+  if (ptKey && ptPin) jobs.push(function (next) { uploadCookie(app, ptPin, ptKey, next); });
+  if (wskey && targetPin) jobs.push(function (next) { uploadWskey(app, targetPin, wskey, next); });
   if (wskey && !targetPin) log('wskey 暂存等待 PIN；未上传青龙');
   if (!jobs.length) { done(); return; }
 
