@@ -1,19 +1,31 @@
 /*
- * 京东 CK / wskey -> 青龙 OpenAPI 直连版（Loon）
- * Based on the uploaded project's business rules:
- *   Main JD app: pt_key -> JD_COOKIE; wskey -> JD_WSCK + jdUser.ini[wskey]
- *   JD Lite app: pt_key -> JD_COOKIE; wskey -> jdUser.ini[jskey] only
+ * 京东 CK / wskey -> 青龙 OpenAPI 直连版（Loon 插件参数版）
+ * Main JD app: pt_key -> JD_COOKIE; wskey -> independently enabled JD_WSCK / jdUser.ini[wskey]
+ * JD Lite app: pt_key -> JD_COOKIE; wskey -> jdUser.ini[jskey]
+ * Qinglong URL / Client ID / Client Secret are read from Loon plugin arguments.
  * No PHP relay, no external telemetry, no third-party upload endpoint.
- *
- * IMPORTANT: Fill QL_URL / CLIENT_ID / CLIENT_SECRET before enabling.
  */
 
+// Loon 插件设置页传入参数；不需要、也不要在源码中填写青龙地址或密钥。
+var ARG = (typeof $argument === 'object' && $argument) ? $argument : {};
+function argString(name, fallback) {
+  var value = ARG[name];
+  return value === undefined || value === null ? (fallback || '') : String(value).trim();
+}
+function argBool(name, fallback) {
+  var value = ARG[name];
+  if (value === undefined || value === null || value === '') return fallback;
+  if (value === true || value === 1) return true;
+  var text = String(value).toLowerCase();
+  return text === 'true' || text === '1' || text === 'yes' || text === 'on';
+}
+
 var CONFIG = {
-  QL_URL: 'https://你的青龙外网域名', // Public HTTPS domain; no trailing slash
+  QL_URL: argString('ql_url').replace(/\/+$/, ''),
   // Public-domain mode: force Qinglong API requests to DIRECT (no proxy node).
-  CLIENT_ID: '替换为青龙应用Client_ID',
-  CLIENT_SECRET: '替换为青龙应用Client_Secret',
-  DEVICE_TAG: 'iphone-main',       // One stable label per phone; change for another phone
+  CLIENT_ID: argString('client_id'),
+  CLIENT_SECRET: argString('client_secret'),
+  DEVICE_TAG: argString('device_tag', 'iphone-main'),
   TIMEOUT_MS: 15000,
   DEDUPE_SECONDS: 30,
   COOLDOWN_SECONDS: 60,
@@ -22,9 +34,12 @@ var CONFIG = {
   PAIR_WINDOW_SECONDS: 300,
   NOTIFY_REPEAT_SECONDS: 600,
   NOTIFY_FAILURE_SECONDS: 60,
-  // Main JD app wskey destinations can be enabled independently.
-  SYNC_JD_WSCK: true,
-  SYNC_JDUSER_INI: true,
+  // 每个同步目标独立读取 Loon 插件开关。
+  UPLOAD_JD_COOKIE: argBool('upload_jd_cookie', true),
+  UPLOAD_LITE_COOKIE: argBool('upload_lite_cookie', true),
+  SYNC_JD_WSCK: argBool('upload_jd_wsck', true),
+  SYNC_JDUSER_INI: argBool('upload_jd_ini_wskey', true),
+  SYNC_LITE_JSKEY: argBool('upload_lite_ini_jskey', true),
   LOG_VERBOSE: false
 };
 
@@ -41,7 +56,7 @@ var APP_NAMES = { jd: '京东主App', lite: '京东特价版' };
 var finished = false;
 
 function log(message) {
-  console.log('[JD→青龙] ' + message);
+  console.log('[JD→青龙 v1.3] ' + message);
 }
 function notify(title, subtitle, message) {
   try { $notification.post(title, subtitle || '', message || ''); }
@@ -419,7 +434,7 @@ function uploadWskey(app, pin, wskey, callback) {
   // must never prevent another enabled target from being attempted or notified.
   var tasks = [];
   if (app === 'lite') {
-    tasks.push({ field: 'jskey', target: 'jdUser.ini[jskey]' });
+    if (CONFIG.SYNC_LITE_JSKEY) tasks.push({ field: 'jskey', target: 'jdUser.ini[jskey]' });
   } else {
     if (CONFIG.SYNC_JD_WSCK) tasks.push({ type: 'env', target: 'JD_WSCK' });
     if (CONFIG.SYNC_JDUSER_INI) tasks.push({ field: 'wskey', target: 'jdUser.ini[wskey]' });
@@ -469,7 +484,7 @@ function pinMask(pin) {
   return s.length > 4 ? s.slice(0, 2) + '***' + s.slice(-2) : s;
 }
 function testConnection() {
-  if (!/^https?:\/\//i.test(CONFIG.QL_URL)) { log('请填写正确的 QL_URL'); done(); return; }
+  if (!/^https?:\/\//i.test(CONFIG.QL_URL)) { log('请在 Loon 插件设置页填写正确的青龙地址'); done(); return; }
   getToken(function (err, token) {
     if (err) { log(err); notify('京东直连青龙测试失败', '', err); done(); return; }
     qlRequest('GET', '/open/envs?searchValue=JD_COOKIE', null, function (envErr, envObj) {
@@ -486,8 +501,8 @@ function testConnection() {
   });
 }
 function main() {
-  if (!CONFIG.QL_URL || /替换/.test(CONFIG.CLIENT_ID) || /替换/.test(CONFIG.CLIENT_SECRET)) {
-    log('请先编辑脚本顶部 CONFIG：QL_URL、CLIENT_ID、CLIENT_SECRET');
+  if (!CONFIG.QL_URL || !/^https?:\/\//i.test(CONFIG.QL_URL) || !CONFIG.CLIENT_ID || !CONFIG.CLIENT_SECRET) {
+    log('请在 Loon 插件设置页填写青龙地址、Client ID 和 Client Secret；无需编辑脚本源码');
     done(); return;
   }
   if (typeof $request === 'undefined' || !$request || !$request.headers) { testConnection(); return; }
@@ -546,7 +561,7 @@ function main() {
   saveLocalState(app, state);
 
   var jobs = [];
-  if (ptKey && ptPin) jobs.push(function (next) { uploadCookie(app, ptPin, ptKey, next); });
+  if (ptKey && ptPin && ((app === 'lite' && CONFIG.UPLOAD_LITE_COOKIE) || (app !== 'lite' && CONFIG.UPLOAD_JD_COOKIE))) jobs.push(function (next) { uploadCookie(app, ptPin, ptKey, next); });
   if (wskey && targetPin) jobs.push(function (next) { uploadWskey(app, targetPin, wskey, next); });
   if (wskey && !targetPin) log('wskey 暂存等待 PIN；未上传青龙');
   if (!jobs.length) { done(); return; }
