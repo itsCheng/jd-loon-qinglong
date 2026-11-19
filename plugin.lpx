@@ -1,7 +1,7 @@
 #!name = 京东CK自动同步-青龙直连
 #!desc = 分别控制主App/特价版捕获，以及各凭证变量上传到青龙
 #!author = Custom
-#!homepage = https://github.com/你的GitHub用户名/jd-loon-qinglong
+#!homepage = https://github.com/itsCheng/jd-loon-qinglong
 #!loon_version = 3.5.1(983)
 #!date = 2026-11-19
 #!tag = 京东,青龙,自动同步
@@ -22,8 +22,8 @@ upload_lite_cookie = switch,true,type=boolean,tag=特价版-上传JD_COOKIE
 upload_lite_ini_jskey = switch,true,type=boolean,tag=特价版-写入jdUser.ini的jskey
 
 [Script]
-request if ${url} ~= /^https?:\/\/(?:[^/]+\.)?jd\.com\//i then script("https://raw.githubusercontent.com/你的GitHub用户名/jd-loon-qinglong/main/jd_to_qinglong_loon.js", {${ql_url}, ${client_id}, ${client_secret}, ${device_tag}, ${capture_jd}, ${capture_lite}, ${upload_jd_cookie}, ${upload_jd_wsck}, ${upload_jd_ini_wskey}, ${upload_lite_cookie}, ${upload_lite_ini_jskey}}) with tag="京东CK自动同步", timeout=60
-generic then script("https://raw.githubusercontent.com/你的GitHub用户名/jd-loon-qinglong/main/jd_to_qinglong_loon.js", {${ql_url}, ${client_id}, ${client_secret}, ${device_tag}, ${capture_jd}, ${capture_lite}, ${upload_jd_cookie}, ${upload_jd_wsck}, ${upload_jd_ini_wskey}, ${upload_lite_cookie}, ${upload_lite_ini_jskey}}) with tag="京东青龙连接测试", timeout=60
+request if ${url} ~= /^https?:\/\/(?:[^/]+\.)?jd\.com\//i then script("https://raw.githubusercontent.com/itsCheng/jd-loon-qinglong/main/jd_to_qinglong_loon.js", {${ql_url}, ${client_id}, ${client_secret}, ${device_tag}, ${capture_jd}, ${capture_lite}, ${upload_jd_cookie}, ${upload_jd_wsck}, ${upload_jd_ini_wskey}, ${upload_lite_cookie}, ${upload_lite_ini_jskey}}) with tag="京东CK自动同步", timeout=60
+generic then script("https://raw.githubusercontent.com/itsCheng/jd-loon-qinglong/main/jd_to_qinglong_loon.js", {${ql_url}, ${client_id}, ${client_secret}, ${device_tag}, ${capture_jd}, ${capture_lite}, ${upload_jd_cookie}, ${upload_jd_wsck}, ${upload_jd_ini_wskey}, ${upload_lite_cookie}, ${upload_lite_ini_jskey}}) with tag="京东青龙连接测试", timeout=60
 
 [Mitm]
 hostname = *.jd.com, jd.com
